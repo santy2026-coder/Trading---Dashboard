@@ -1,355 +1,668 @@
-17904464893072518880249482407301.jpg
-
-17904467568824543963496559033674.jpg
-
-17904478714883788334811667337341.jpg
-
-17904482751828019906873616513432.jpg
-
-17904485592477499018153296131020.jpg
-
-Haan bhai 👍 “Forgot Password?” option bhi add kar denge.
-
-Login screen:
-
-┌─────────────────────────────┐
-│      TRADING DASHBOARD      │
-│                             │
-│ Username                    │
-│ [_______________________]   │
-│                             │
-│ Password                    │
-│ [_______________________]   │
-│                             │
-│       [ LOGIN ]             │
-│                             │
-│    Forgot Password?         │
-└─────────────────────────────┘
-Forgot Password flow
-Forgot Password? par click
-
-Registered email/username verify
-
-Verification code/OTP
-
-New password set
-
-Login with new password
-
-Aur admin/admin123 initial credentials rahenge, lekin password change karne ke baad naya password use hoga.
-
-Security ke liye final app mein password ko plain text mein store nahi karenge; hashed password + secure reset mechanism rakhenge.
-
-
-Ishme analysis mein fii,dii usd inr,crude oil price and geopolitical news bhi hona chahiye 
-
-Haan bhai, ye sab Analysis Dashboard mein add karna chahiye. Isse technical analysis ke saath macro/market-context bhi ek jagah milega.
-
-📊 New “Market & Macro Analysis” section
-1. FII / DII
-
-FII/FPI net buying/selling
-
-DII net buying/selling
-
-Daily / 7-day / 30-day flow
-
-Cash-market data
-
-Futures/options data where available
-
-Last updated time
-
-NSE khud FII/FPI & DII activity publish karta hai aur notes mein data ko provisional batata hai. 
-
-2. USD/INR
-
-Live/current USDINR
-
-Change %
-
-Day high/low
-
-Chart
-
-USDINR trend
-
-3. Crude Oil
-
-WTI
-
-Brent, if the selected data source supports it
-
-Price/change %
-
-Day high/low
-
-Chart
-
-Crude specifically important macro input hai; current market reporting mein oil, rupee aur geopolitical developments ko Indian equities ke context mein track kiya ja raha hai. 
-
-4. 🌍 Geopolitical News
-Dashboard automatically recent market-relevant headlines collect karega, jaise:
-
-Middle East
-
-US–China
-
-Russia–Ukraine
-
-India-related geopolitical developments
-
-Oil supply / shipping / Strait of Hormuz
-
-Major central-bank/geopolitical events
-
-Har news ke saath:
-
-Headline
-
-Source
-
-Published time/date
-
-Link
-
-Short factual summary
-
-🔄 Auto-refresh
-Ye section bhi live dashboard ke saath refresh hoga, lekin news ko har 1–2 second mein request nahi karenge. Price data aur news/macro data ke refresh intervals alag rakhenge, taaki API rate limits aur unnecessary latency na badhe.
-
-🧠 Analysis mein kaise use hoga
-Dashboard ek separate Market Context panel banayega:
-
-MARKET CONTEXT
-────────────────────────────
-FII             ₹ -3,693 Cr
-DII             ₹ +2,838 Cr
-
-USD/INR         ₹95.xx
-Crude WTI       $92.xx
-
-Geopolitical Risk Events
-• Headline 1
-• Headline 2
-• Headline 3
-
-Technical Score
-PCR Score
-FII/DII Context
-Macro Context
-────────────────────────────
-Important: FII/DII, USD/INR, crude aur news ko signal engine mein mechanically include karenge, lekin unhe guaranteed BUY/SELL prediction nahi maana jayega. For example, current NSE/market data itself can be provisional and macro relationships can change. 
-
-Ab tumhari requirements kaafi complete ho gayi hain: login + forgot password + live/auto-refresh + NIFTY/BANKNIFTY/stocks/crypto + indicators + patterns + PCR + FII/DII + USDINR + crude + geopolitical news + paper BUY/SELL + auto Entry/SL/Target + live P/L + broker links.
-
-
-Ok ab pura ek sath de do
-
-Haan bhai — pura combined final version ready hai. Maine code ko syntax-check bhi kar liya hai.
-
-📦 Files
-Download app.py
-
-Download requirements.txt
-
-Is final version mein included hai
-🔐 Username/password login — admin / admin123
-
-🔑 Forgot Password + recovery code
-
-📈 NIFTY, BANKNIFTY + major stocks
-
-₿ BTC, ETH, BNB, SOL, XRP, ADA, DOGE, AVAX
-
-🔄 Auto-refresh live dashboard
-
-EMA 5/21/50/200
-
-RSI, MACD, VWAP, ATR
-
-Support/Resistance
-
-Breakout logic
-
-Candlestick patterns
-
-📊 NIFTY/BANKNIFTY PCR
-
-FII/DII
-
-USD/INR
-
-WTI + Brent crude
-
-🌍 Geopolitical/market news
-
-🧪 Paper BUY / SELL
-
-Automatic Entry
-
-Automatic Stop Loss
-
-Automatic Target
-
-Automatic quantity based on risk
-
-Live P/L while position is open
-
-Exit par Realized P/L
-
-Exit ke baad Post-Exit Live P/L
-
-Paper-trading history
-
-Major broker/exchange links:
-
-Zerodha
-
-Upstox
-
-Angel One
-
-Dhan
-
-Groww
-
-5paisa
-
-ICICI Direct
-
-Sahi
-
-Delta Exchange
-
-Lemonn
-
-Motilal Oswal
-
-Sahi, Delta Exchange, Lemonn aur Motilal Oswal ke official links verify kiye gaye hain. 
-
-Ek important limitation: Yahoo Finance polling ko “zero latency/tick-by-tick” nahi maana ja sakta. Final code mein auto-refresh hai, lekin genuinely low-latency live trading data ke liye broker/exchange WebSocket feed integrate karna hoga. Code mein real order placement intentionally nahi hai—BUY/SELL buttons paper trades hain.
-
-GitHub mein lagane ka next step
-app.py download karke GitHub ke existing app.py mein:
-
-Ctrl+A → Delete → pura code paste → Commit changes
-
-Phir requirements.txt bhi upload/create karke usmein diya hua content paste karna hai.
-
-Uske baad Streamlit Cloud par deploy karenge. 
-
-
-app.py
-Code
-
-
-requirements.txt
-Document
-
-
-No file chosen
-Library
-/
-app.py
-
-
-
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-11
-12
-13
-14
-15
-16
-17
-18
-19
-20
-21
-22
-23
-24
-25
-26
-27
-28
-29
-30
-31
-32
-33
-34
-35
-36
-37
-38
-39
-40
-41
-42
-43
-44
-45
-46
-47
-48
-49
-
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import plotly.graph_objects as go
 import requests
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-import math
+from datetime import datetime, timedelta
 
+# =========================================================
+# PAGE CONFIG
+# =========================================================
 st.set_page_config(
-    page_title="Live Trading Analysis Dashboard",
+    page_title="Trading Dashboard",
     page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    layout="wide"
 )
 
-# ============================================================
-# AUTHENTICATION
-# ============================================================
-DEFAULT_USER = "admin"
-DEFAULT_PASS = "admin123"
-DEFAULT_RECOVERY = "RESET123"
-
-def get_secret(name, default):
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
-
-AUTH_USER = get_secret("AUTH_USER", DEFAULT_USER)
-AUTH_PASS = get_secret("AUTH_PASS", DEFAULT_PASS)
-RECOVERY_CODE = get_secret("RECOVERY_CODE", DEFAULT_RECOVERY)
-
+# =========================================================
+# LOGIN
+# =========================================================
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
-if "active_password" not in st.session_state:
-    st.session_state.active_password = AUTH_PASS
-if "paper_capital" not in st.session_state:
-    st.session_state.paper_capital = 100000.0
-if "paper_history" not in st.session_state:
-    st.session_state.paper_history = []
-if "open_position" not in st.session_state:
-    st.session_state.open_position = None
+
+if "paper_trades" not in st.session_state:
+    st.session_state.paper_trades = []
+
+if "balance" not in st.session_state:
+    st.session_state.balance = 100000.0
+
+
+def login_page():
+    st.title("📈 Trading Dashboard")
+    st.subheader("Login")
+
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button("Login", use_container_width=True):
+            if username == "admin" and password == "admin123":
+                st.session_state.logged_in = True
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
+
+    with c2:
+        if st.button("Forgot Password", use_container_width=True):
+            st.info("Default username: admin | Default password: admin123")
+
 
 if not st.session_state.logged_in:
-    st.title("🔐 Trading Dashboard Login")
-    st.caption("Live market analysis + paper trading")
+    login_page()
+    st.stop()
+
+# =========================================================
+# FUNCTIONS
+# =========================================================
+@st.cache_data(ttl=30)
+def get_data(symbol, period="1mo", interval="15m"):
+    try:
+        data = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False
+        )
+
+        if data.empty:
+            return pd.DataFrame()
+
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+
+        data = data.dropna()
+        return data
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def calculate_indicators(df):
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+    volume = df["Volume"]
+
+    # EMA
+    df["EMA5"] = close.ewm(span=5, adjust=False).mean()
+    df["EMA21"] = close.ewm(span=21, adjust=False).mean()
+    df["EMA50"] = close.ewm(span=50, adjust=False).mean()
+    df["EMA200"] = close.ewm(span=200, adjust=False).mean()
+
+    # RSI
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    # MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+
+    df["MACD"] = ema12 - ema26
+    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
+
+    # ATR
+    prev_close = close.shift(1)
+
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["ATR"] = true_range.rolling(14).mean()
+
+    # VWAP
+    typical_price = (high + low + close) / 3
+
+    cumulative_volume = volume.cumsum()
+    cumulative_pv = (typical_price * volume).cumsum()
+
+    df["VWAP"] = cumulative_pv / cumulative_volume.replace(0, np.nan)
+
+    return df
+
+
+def detect_patterns(df):
+    patterns = []
+
+    if len(df) < 5:
+        return patterns
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # Bullish / bearish candle
+    if last["Close"] > last["Open"]:
+        patterns.append("Bullish Candle")
+
+    if last["Close"] < last["Open"]:
+        patterns.append("Bearish Candle")
+
+    # EMA trend
+    if last["EMA5"] > last["EMA21"] > last["EMA50"]:
+        patterns.append("Bullish EMA Alignment")
+
+    if last["EMA5"] < last["EMA21"] < last["EMA50"]:
+        patterns.append("Bearish EMA Alignment")
+
+    # Golden / Death cross
+    if prev["EMA50"] <= prev["EMA200"] and last["EMA50"] > last["EMA200"]:
+        patterns.append("Golden Cross")
+
+    if prev["EMA50"] >= prev["EMA200"] and last["EMA50"] < last["EMA200"]:
+        patterns.append("Death Cross")
+
+    # RSI
+    if last["RSI"] < 30:
+        patterns.append("RSI Oversold")
+
+    if last["RSI"] > 70:
+        patterns.append("RSI Overbought")
+
+    # MACD
+    if last["MACD"] > last["MACD_SIGNAL"]:
+        patterns.append("MACD Bullish")
+
+    if last["MACD"] < last["MACD_SIGNAL"]:
+        patterns.append("MACD Bearish")
+
+    return patterns
+
+
+def market_signal(row):
+    score = 0
+
+    if row["Close"] > row["EMA21"]:
+        score += 1
+
+    if row["EMA5"] > row["EMA21"]:
+        score += 1
+
+    if row["EMA21"] > row["EMA50"]:
+        score += 1
+
+    if row["MACD"] > row["MACD_SIGNAL"]:
+        score += 1
+
+    if row["RSI"] > 50:
+        score += 1
+
+    if row["Close"] > row["VWAP"]:
+        score += 1
+
+    if score >= 5:
+        return "BULLISH"
+
+    if score <= 2:
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+
+def get_news():
+    try:
+        url = "https://query1.finance.yahoo.com/v1/finance/search?q=India%20stock%20market"
+        response = requests.get(
+            url,
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+
+        data = response.json()
+
+        news = []
+
+        for item in data.get("news", [])[:8]:
+            title = item.get("title", "")
+            link = item.get("link", "")
+
+            if title:
+                news.append((title, link))
+
+        return news
+
+    except Exception:
+        return []
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+st.sidebar.title("⚙️ Dashboard")
+
+symbol = st.sidebar.text_input(
+    "Symbol",
+    value="RELIANCE.NS"
+).upper()
+
+period = st.sidebar.selectbox(
+    "Chart Period",
+    ["1d", "5d", "1mo", "3mo", "6mo", "1y"],
+    index=2
+)
+
+interval_options = {
+    "1 Minute": "1m",
+    "5 Minutes": "5m",
+    "15 Minutes": "15m",
+    "30 Minutes": "30m",
+    "1 Hour": "60m",
+    "Daily": "1d"
+}
+
+interval_name = st.sidebar.selectbox(
+    "Timeframe",
+    list(interval_options.keys()),
+    index=2
+)
+
+interval = interval_options[interval_name]
+
+if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
+if st.sidebar.button("🚪 Logout", use_container_width=True):
+    st.session_state.logged_in = False
+    st.rerun()
+
+# =========================================================
+# MAIN HEADER
+# =========================================================
+st.title("📈 Advanced Trading Dashboard")
+st.caption(f"Symbol: {symbol} | Timeframe: {interval_name}")
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+df = get_data(symbol, period, interval)
+
+if df.empty:
+    st.error(
+        "Market data available nahi hai. "
+        "Symbol check karein, example: RELIANCE.NS, TCS.NS, INFY.NS, ^NSEI"
+    )
+    st.stop()
+
+df = calculate_indicators(df)
+last = df.iloc[-1]
+
+# =========================================================
+# TOP METRICS
+# =========================================================
+price = float(last["Close"])
+change = price - float(df["Close"].iloc[-2])
+change_pct = (change / float(df["Close"].iloc[-2])) * 100
+
+signal = market_signal(last)
+
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+
+c1.metric("Live Price", f"₹{price:,.2f}", f"{change:+.2f}")
+c2.metric("Change %", f"{change_pct:+.2f}%")
+c3.metric("RSI", f"{last['RSI']:.2f}")
+c4.metric("MACD", f"{last['MACD']:.2f}")
+c5.metric("ATR", f"{last['ATR']:.2f}")
+c6.metric("Signal", signal)
+
+# =========================================================
+# CHART
+# =========================================================
+st.subheader("📊 Price & Indicators")
+
+fig = go.Figure()
+
+fig.add_trace(
+    go.Candlestick(
+        x=df.index,
+        open=df["Open"],
+        high=df["High"],
+        low=df["Low"],
+        close=df["Close"],
+        name="Price"
+    )
+)
+
+fig.add_trace(
+    go.Scatter(
+        x=df.index,
+        y=df["EMA5"],
+        name="EMA 5",
+        line=dict(width=1)
+    )
+)
+
+fig.add_trace(
+    go.Scatter(
+        x=df.index,
+        y=df["EMA21"],
+        name="EMA 21",
+        line=dict(width=1)
+    )
+)
+
+fig.add_trace(
+    go.Scatter(
+        x=df.index,
+        y=df["EMA50"],
+        name="EMA 50",
+        line=dict(width=1)
+    )
+)
+
+fig.add_trace(
+    go.Scatter(
+        x=df.index,
+        y=df["EMA200"],
+        name="EMA 200",
+        line=dict(width=1)
+    )
+)
+
+fig.add_trace(
+    go.Scatter(
+        x=df.index,
+        y=df["VWAP"],
+        name="VWAP",
+        line=dict(width=2)
+    )
+)
+
+fig.update_layout(
+    height=600,
+    xaxis_rangeslider_visible=False,
+    template="plotly_dark"
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# =========================================================
+# INDICATOR PANEL
+# =========================================================
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("📈 RSI")
+
+    rsi_fig = go.Figure()
+
+    rsi_fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["RSI"],
+            name="RSI"
+        )
+    )
+
+    rsi_fig.add_hline(y=70)
+    rsi_fig.add_hline(y=30)
+
+    rsi_fig.update_layout(
+        height=300,
+        yaxis_title="RSI",
+        template="plotly_dark"
+    )
+
+    st.plotly_chart(rsi_fig, use_container_width=True)
+
+with col2:
+    st.subheader("📊 MACD")
+
+    macd_fig = go.Figure()
+
+    macd_fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["MACD"],
+            name="MACD"
+        )
+    )
+
+    macd_fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["MACD_SIGNAL"],
+            name="Signal"
+        )
+    )
+
+    macd_fig.update_layout(
+        height=300,
+        template="plotly_dark"
+    )
+
+    st.plotly_chart(macd_fig, use_container_width=True)
+
+# =========================================================
+# PATTERNS
+# =========================================================
+st.subheader("🔎 Technical Analysis")
+
+patterns = detect_patterns(df)
+
+if patterns:
+    for pattern in patterns:
+        st.info(f"• {pattern}")
+else:
+    st.info("No major pattern detected")
+
+# =========================================================
+# PAPER TRADING
+# =========================================================
+st.subheader("📝 Paper Trading")
+
+trade_col1, trade_col2 = st.columns(2)
+
+with trade_col1:
+    quantity = st.number_input(
+        "Quantity",
+        min_value=1,
+        value=1,
+        step=1
+    )
+
+    entry_price = st.number_input(
+        "Entry Price",
+        min_value=0.0,
+        value=float(price),
+        step=0.05
+    )
+
+    stop_loss = st.number_input(
+        "Stop Loss",
+        min_value=0.0,
+        value=max(0.0, float(price - last["ATR"])),
+        step=0.05
+    )
+
+    target = st.number_input(
+        "Target",
+        min_value=0.0,
+        value=float(price + last["ATR"] * 2),
+        step=0.05
+    )
+
+with trade_col2:
+    side = st.selectbox(
+        "Position",
+        ["BUY", "SELL"]
+    )
+
+    live_pnl = 0.0
+
+    if side == "BUY":
+        live_pnl = (price - entry_price) * quantity
+    else:
+        live_pnl = (entry_price - price) * quantity
+
+    st.metric(
+        "Live P/L",
+        f"₹{live_pnl:,.2f}"
+    )
+
+    st.write(f"**Live Price:** ₹{price:,.2f}")
+    st.write(f"**Entry:** ₹{entry_price:,.2f}")
+    st.write(f"**Stop Loss:** ₹{stop_loss:,.2f}")
+    st.write(f"**Target:** ₹{target:,.2f}")
+
+    if st.button("➕ Open Paper Trade", use_container_width=True):
+        trade = {
+            "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Symbol": symbol,
+            "Side": side,
+            "Quantity": quantity,
+            "Entry": entry_price,
+            "Stop Loss": stop_loss,
+            "Target": target,
+            "Live Price": price,
+            "P/L": live_pnl
+        }
+
+        st.session_state.paper_trades.append(trade)
+        st.success("Paper trade opened")
+
+# =========================================================
+# PAPER TRADE TABLE
+# =========================================================
+if st.session_state.paper_trades:
+    st.subheader("📋 Paper Trade Positions")
+
+    trades_df = pd.DataFrame(st.session_state.paper_trades)
+
+    # Update live P/L
+    for i in range(len(trades_df)):
+        trade_side = trades_df.loc[i, "Side"]
+        entry = float(trades_df.loc[i, "Entry"])
+        qty = float(trades_df.loc[i, "Quantity"])
+
+        trades_df.loc[i, "Live Price"] = price
+
+        if trade_side == "BUY":
+            trades_df.loc[i, "P/L"] = (price - entry) * qty
+        else:
+            trades_df.loc[i, "P/L"] = (entry - price) * qty
+
+    st.dataframe(
+        trades_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    if st.button("❌ Clear Paper Trades"):
+        st.session_state.paper_trades = []
+        st.rerun()
+
+# =========================================================
+# MARKET ANALYSIS
+# =========================================================
+st.subheader("🌐 Market Analysis")
+
+m1, m2, m3, m4 = st.columns(4)
+
+# These are reference instruments available through Yahoo Finance.
+try:
+    usd = get_data("INR=X", "5d", "1d")
+    crude = get_data("CL=F", "5d", "1d")
+    nifty = get_data("^NSEI", "5d", "1d")
+    banknifty = get_data("^NSEBANK", "5d", "1d")
+
+    usd_price = float(usd["Close"].iloc[-1]) if not usd.empty else 0
+    crude_price = float(crude["Close"].iloc[-1]) if not crude.empty else 0
+    nifty_price = float(nifty["Close"].iloc[-1]) if not nifty.empty else 0
+    banknifty_price = float(banknifty["Close"].iloc[-1]) if not banknifty.empty else 0
+
+except Exception:
+    usd_price = crude_price = nifty_price = banknifty_price = 0
+
+m1.metric("USD / INR", f"₹{usd_price:,.2f}" if usd_price else "N/A")
+m2.metric("Crude Oil", f"${crude_price:,.2f}" if crude_price else "N/A")
+m3.metric("NIFTY 50", f"{nifty_price:,.2f}" if nifty_price else "N/A")
+m4.metric("BANK NIFTY", f"{banknifty_price:,.2f}" if banknifty_price else "N/A")
+
+# =========================================================
+# FII / DII
+# =========================================================
+st.subheader("🏦 FII / DII")
+
+st.info(
+    "FII/DII data source-dependent hai. "
+    "Is dashboard mein live market-price data Yahoo Finance se aata hai. "
+    "Official NSE FII/DII figures ko final trading decision se pehle verify karein."
+)
+
+fii_col1, fii_col2 = st.columns(2)
+
+with fii_col1:
+    st.metric("FII", "Data source required")
+
+with fii_col2:
+    st.metric("DII", "Data source required")
+
+# =========================================================
+# NEWS
+# =========================================================
+st.subheader("📰 Market & Geopolitical News")
+
+news = get_news()
+
+if news:
+    for title, link in news:
+        st.markdown(f"• [{title}]({link})")
+else:
+    st.info("News temporarily unavailable.")
+
+# =========================================================
+# DATA TABLE
+# =========================================================
+with st.expander("📑 Latest Market Data"):
+    display_cols = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+        "EMA5",
+        "EMA21",
+        "EMA50",
+        "EMA200",
+        "VWAP",
+        "RSI",
+        "MACD",
+        "ATR"
+    ]
+
+    available_cols = [
+        col for col in display_cols
+        if col in df.columns
+    ]
+
+    st.dataframe(
+        df[available_cols].tail(20),
+        use_container_width=True
+    )
+
+# =========================================================
+# FOOTER
+# =========================================================
+st.divider()
+
+st.caption(
+    "Trading Dashboard | Live data may be delayed or unavailable. "
+    "This application is for informational and paper-trading purposes."
+)
