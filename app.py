@@ -4,34 +4,45 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+import os
 from urllib.parse import quote
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
     st_autorefresh = None
 
-st.set_page_config(page_title='Advanced Trading Dashboard', page_icon='ðŸ“ˆ', layout='wide')
+st.set_page_config(page_title='Advanced Trading Dashboard', page_icon='Ã°Å¸â€œË†', layout='wide')
 
 # ---------------- STATE ----------------
-for k, v in {'logged_in':False,'paper_trades':[],'realized_pnl':0.0,'balance':100000.0}.items():
+for k, v in {'logged_in':False,'paper_trades':[],'realized_pnl':0.0,'balance':100000.0,'risk_per_trade':1.0,'max_position_value':100000.0,'auto_exit':False,'last_data_status':'Unknown'}.items():
     if k not in st.session_state: st.session_state[k] = v
+if 'demo_password' not in st.session_state: st.session_state.demo_password = 'admin123'
 
 # ---------------- LOGIN ----------------
 def login_page():
-    st.title('ðŸ“ˆ Advanced Trading Dashboard')
+    st.title('Ã°Å¸â€œË† Advanced Trading Dashboard')
     st.caption('Login')
     with st.form('login'):
         u = st.text_input('Username')
         p = st.text_input('Password', type='password')
         ok = st.form_submit_button('Login', use_container_width=True)
     if ok:
-        if u == 'admin' and p == 'admin123':
+        if u == 'admin' and p == st.session_state.demo_password:
             st.session_state.logged_in = True
             st.rerun()
         st.error('Invalid username or password')
-    with st.expander('Forgot Password'):
-        st.info('Demo credentials: admin / admin123')
+    with st.expander('Forgot Password / Demo Recovery'):
+        st.caption('For this local/demo build only. Change credentials before production use.')
+        recovery = st.text_input('Recovery PIN', type='password')
+        new_pass = st.text_input('New Password', type='password')
+        if st.button('Reset Password'):
+            if recovery == os.getenv('TRADING_RECOVERY_PIN', '1234') and len(new_pass) >= 6:
+                st.session_state.demo_password = new_pass
+                st.success('Password reset for this session. Login again with username admin.')
+            else:
+                st.error('Invalid recovery PIN or password too short.')
 
 if not st.session_state.logged_in:
     login_page(); st.stop()
@@ -323,6 +334,8 @@ def backtest(symbol, period):
         'sell_confirm_win_rate': float(sell_confirm['Win'].mean() * 100) if len(sell_confirm) else np.nan,
         'strong_buy_win_rate': float(bt.loc[bt['Strength']=='STRONG BUY','Win'].mean()*100) if (bt['Strength']=='STRONG BUY').any() else np.nan,
         'strong_sell_win_rate': float(bt.loc[bt['Strength']=='STRONG SELL','Win'].mean()*100) if (bt['Strength']=='STRONG SELL').any() else np.nan,
+        'max_drawdown_pct': float((bt['Return %'].cumsum().cummax()-bt['Return %'].cumsum()).max()) if len(bt) else 0.0,
+        'net_return_pct': float(bt['Return %'].sum()),
     }
     return bt, stats
 
@@ -449,9 +462,81 @@ def critical_market_analysis(strength, mf_score, trend, volume_ratio, pcr, news_
     if abs(price-prev_close)/prev_close<0.002: factors.append('Price is close to previous close; confirmation preferred')
     return {'score':score,'action':action,'factors':factors}
 
+
+# ---------------- REQUIREMENT HELPERS ----------------
+def market_status():
+    """NSE-style status using India local time; holidays are not hard-coded."""
+    now = datetime.now(ZoneInfo('Asia/Kolkata'))
+    if now.weekday() >= 5:
+        return 'CLOSED / WEEKEND', now.strftime('%Y-%m-%d %H:%M:%S IST')
+    mins = now.hour * 60 + now.minute
+    if mins < 9*60:
+        return 'PRE-OPEN', now.strftime('%Y-%m-%d %H:%M:%S IST')
+    if mins < 9*60+15:
+        return 'PRE-OPEN / AUCTION', now.strftime('%Y-%m-%d %H:%M:%S IST')
+    if mins < 15*60+30:
+        return 'MARKET OPEN', now.strftime('%Y-%m-%d %H:%M:%S IST')
+    return 'CLOSED', now.strftime('%Y-%m-%d %H:%M:%S IST')
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fii_dii_feed():
+    """Fetch NSE FII/DII cash-market activity. Returns empty data when blocked/unavailable; never fabricates values."""
+    try:
+        h={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*','Referer':'https://www.nseindia.com/'}
+        ss=requests.Session(); ss.get('https://www.nseindia.com/',headers=h,timeout=8)
+        r=ss.get('https://www.nseindia.com/api/fiidiiTradeReact',headers=h,timeout=8)
+        if not r.ok: return pd.DataFrame()
+        payload=r.json()
+        rows=payload if isinstance(payload,list) else payload.get('data',[])
+        out=[]
+        for x in rows:
+            if not isinstance(x,dict): continue
+            out.append(x)
+        return pd.DataFrame(out)
+    except Exception:
+        return pd.DataFrame()
+
+def risk_position_size(entry, stop, balance, risk_pct, max_value):
+    try:
+        risk_cash=max(0,float(balance))*max(0,float(risk_pct))/100.0
+        per_unit=abs(float(entry)-float(stop))
+        if per_unit<=0: return 0,0.0
+        qty=int(risk_cash/per_unit)
+        qty=max(0, min(qty, int(max_value/max(float(entry),0.01))))
+        return qty, qty*per_unit
+    except Exception:
+        return 0,0.0
+
+def update_open_paper_positions(live_price):
+    """Update trailing stops and auto-exit open paper positions when enabled."""
+    if not st.session_state.get('auto_exit'): return []
+    events=[]
+    for i,t in enumerate(st.session_state.paper_trades):
+        if t.get('Status')!='OPEN' or t.get('Symbol') != symbol: continue
+        side=t['Side']; entry=float(t['Entry']); sl=float(t['Stop Loss']); target=float(t['Target'])
+        atr=float(last['ATR']) if pd.notna(last['ATR']) else abs(entry)*0.01
+        trail_gap=max(atr,abs(entry)*0.002)
+        old_trail=float(t.get('Trailing Stop', sl))
+        new_trail=max(old_trail, live_price-trail_gap) if side=='BUY' else min(old_trail, live_price+trail_gap)
+        t['Trailing Stop']=new_trail
+        hit_sl=(live_price<=new_trail) if side=='BUY' else (live_price>=new_trail)
+        hit_target=(live_price>=target) if side=='BUY' else (live_price<=target)
+        if hit_sl or hit_target:
+            exit_price=live_price
+            reason='TARGET' if hit_target else 'TRAILING SL'
+            close_trade(i, exit_price)
+            t['Exit Reason']=reason; events.append(f"Paper #{i+1} auto-exited: {reason} @ {exit_price:.2f}")
+    return events
+
 # ---------------- SIDEBAR ----------------
-st.sidebar.title('âš™ï¸ Dashboard')
-auto_refresh = st.sidebar.toggle('âš¡ Auto Refresh', value=False, help='Refresh live data automatically')
+st.sidebar.title('Ã¢Å¡â„¢Ã¯Â¸Â Dashboard')
+status, ist_now = market_status()
+st.sidebar.info(f'**Market:** {status}\n\n{ist_now}')
+st.sidebar.subheader('Risk Controls')
+st.session_state.risk_per_trade = st.sidebar.number_input('Risk / Trade %', 0.1, 10.0, float(st.session_state.risk_per_trade), 0.1)
+st.session_state.max_position_value = st.sidebar.number_input('Max Position Value â‚¹', 1000.0, 10000000.0, float(st.session_state.max_position_value), 1000.0)
+st.session_state.auto_exit = st.sidebar.toggle('Paper Auto SL/Target/Trailing', value=st.session_state.auto_exit)
+auto_refresh = st.sidebar.toggle('Ã¢Å¡Â¡ Auto Refresh', value=False, help='Refresh live data automatically')
 refresh_seconds = st.sidebar.selectbox('Refresh Interval', [15,30,60,120,300], index=2, format_func=lambda x:f'{x} seconds', disabled=not auto_refresh)
 if auto_refresh and st_autorefresh is not None:
     st_autorefresh(interval=refresh_seconds*1000, key='live_market_autorefresh')
@@ -466,16 +551,19 @@ periods={'1 Day':'1d','5 Days':'5d','1 Month':'1mo','3 Months':'3mo','6 Months':
 period_name=st.sidebar.selectbox('Chart Period',list(periods),index=2)
 ints={'5 Minutes':'5m','15 Minutes':'15m','30 Minutes':'30m','1 Hour':'60m','Daily':'1d'}
 int_name=st.sidebar.selectbox('Timeframe',list(ints),index=1)
-if st.sidebar.button('ðŸ”„ Refresh Data',use_container_width=True):st.cache_data.clear();st.rerun()
-if st.sidebar.button('ðŸšª Logout',use_container_width=True):st.session_state.logged_in=False;st.rerun()
+if st.sidebar.button('Ã°Å¸â€â€ž Refresh Data',use_container_width=True):st.cache_data.clear();st.rerun()
+if st.sidebar.button('Ã°Å¸Å¡Âª Logout',use_container_width=True):st.session_state.logged_in=False;st.rerun()
 
 # ---------------- MAIN ----------------
-st.title('ðŸ“ˆ Advanced Trading Dashboard')
-st.caption(f'{name} â€¢ {symbol} â€¢ {int_name} â€¢ {datetime.now().strftime("%H:%M:%S")} â€¢ Auto Refresh: {"ON" if auto_refresh else "OFF"}')
+st.title('Ã°Å¸â€œË† Advanced Trading Dashboard')
+st.caption(f'{name} Ã¢â‚¬Â¢ {symbol} Ã¢â‚¬Â¢ {int_name} Ã¢â‚¬Â¢ {datetime.now().strftime("%H:%M:%S")} Ã¢â‚¬Â¢ Auto Refresh: {"ON" if auto_refresh else "OFF"}')
 d=data(symbol,periods[period_name],ints[int_name])
 if d.empty:st.error('Data unavailable. Try another symbol or Daily timeframe.');st.stop()
 d=indicators(d); last=d.iloc[-1]; prev=d.iloc[-2] if len(d)>1 else last
 price=float(last.Close); change=price-float(prev.Close); pct=change/float(prev.Close)*100 if prev.Close else 0
+auto_events=update_open_paper_positions(price)
+if auto_events:
+    for ev in auto_events: st.toast(ev)
 pcr_oi, pcr_summary, pcr_status = option_pcr(symbol)
 strength, mf_score, vol_label, vol_ratio, pcr_label, live_confirmation = multifactor_signal(last, d, pcr_oi)
 sig,score=signal(last)
@@ -490,20 +578,20 @@ critical = critical_market_analysis(strength, mf_score, trend_now, vol_ratio, pc
 
 m=st.columns(8); m[0].metric('Live Price',f'{price:,.2f}',f'{change:+.2f}');m[1].metric('Change',f'{pct:+.2f}%');m[2].metric('RSI',f'{last.RSI:.2f}');m[3].metric('MACD',f'{last.MACD:.2f}');m[4].metric('VWAP',f'{last.VWAP:.2f}');m[5].metric('ATR',f'{last.ATR:.2f}');m[6].metric('ADX',f'{last.ADX:.2f}');m[7].metric('Signal',strength,f'Score {mf_score}/10')
 
-st.subheader('ðŸŽ¯ Trade Setup â€” Entry / Targets / Stop Loss')
+st.subheader('Ã°Å¸Å½Â¯ Trade Setup Ã¢â‚¬â€ Entry / Targets / Stop Loss')
 if levels['Direction'] != 'WAIT':
     e1,e2,e3,e4,e5,e6=st.columns(6)
-    e1.metric('Suggested Entry',f"â‚¹{levels['Entry']:,.2f}")
-    e2.metric('Initial Stop Loss',f"â‚¹{levels['Stop Loss']:,.2f}")
-    e3.metric('Target 1',f"â‚¹{levels['Target 1']:,.2f}")
-    e4.metric('Target 2',f"â‚¹{levels['Target 2']:,.2f}")
-    e5.metric('Target 3',f"â‚¹{levels['Target 3']:,.2f}")
-    e6.metric('Trailing Stop',f"â‚¹{levels['Trailing Stop']:,.2f}")
-    st.caption(f"{levels['Direction']} setup â€¢ Break-even stop after T1: â‚¹{levels['Break-even Stop']:,.2f} â€¢ Approx. Risk/Reward to T2: 1:{levels['RR to T2']:.2f}")
+    e1.metric('Suggested Entry',f"Ã¢â€šÂ¹{levels['Entry']:,.2f}")
+    e2.metric('Initial Stop Loss',f"Ã¢â€šÂ¹{levels['Stop Loss']:,.2f}")
+    e3.metric('Target 1',f"Ã¢â€šÂ¹{levels['Target 1']:,.2f}")
+    e4.metric('Target 2',f"Ã¢â€šÂ¹{levels['Target 2']:,.2f}")
+    e5.metric('Target 3',f"Ã¢â€šÂ¹{levels['Target 3']:,.2f}")
+    e6.metric('Trailing Stop',f"Ã¢â€šÂ¹{levels['Trailing Stop']:,.2f}")
+    st.caption(f"{levels['Direction']} setup Ã¢â‚¬Â¢ Break-even stop after T1: Ã¢â€šÂ¹{levels['Break-even Stop']:,.2f} Ã¢â‚¬Â¢ Approx. Risk/Reward to T2: 1:{levels['RR to T2']:.2f}")
 else:
     st.info('No clear BUY/SELL signal. Entry, targets and stop-loss are not activated until a directional signal appears.')
 
-st.subheader('ðŸ§  Live Critical Analysis')
+st.subheader('Ã°Å¸Â§  Live Critical Analysis')
 ca,cb,cc,cd,ce=st.columns(5)
 ca.metric('Critical Action', critical['action'])
 cb.metric('Critical Score', f"{critical['score']:+d}")
@@ -511,10 +599,10 @@ cc.metric('News Bias', news_info['bias'])
 cd.metric('News Risk', news_info['risk'])
 ce.metric('Headline Count', len(news_items))
 if critical['factors']:
-    st.write('**Factors:** ' + ' â€¢ '.join(critical['factors']))
+    st.write('**Factors:** ' + ' Ã¢â‚¬Â¢ '.join(critical['factors']))
 st.caption('Rule-based multifactor/news analysis. It is not a guaranteed prediction and does not execute real orders.')
 
-st.subheader('ðŸ“ž CALL / PUT Candidate')
+st.subheader('Ã°Å¸â€œÅ¾ CALL / PUT Candidate')
 if critical['action'].startswith('CALL') and not option_suggest.empty:
     cand=option_suggest[option_suggest['Type']=='CALL'].copy()
     st.dataframe(cand,use_container_width=True,hide_index=True)
@@ -524,7 +612,7 @@ elif critical['action'].startswith('PUT') and not option_suggest.empty:
 else:
     st.info('No clear CALL/PUT candidate. Wait for technical + volume + news confirmation, or check the Options tab for available contracts.')
 
-st.subheader('ðŸ“Š Price & Indicators')
+st.subheader('Ã°Å¸â€œÅ  Price & Indicators')
 fig=go.Figure(go.Candlestick(x=d.index,open=d.Open,high=d.High,low=d.Low,close=d.Close,name='Price'))
 for col in ['EMA5','EMA21','EMA50','EMA200','VWAP','BB_UPPER','BB_LOWER','SUPPORT','RESISTANCE','PIVOT','R1','S1']:
     if col in d:fig.add_trace(go.Scatter(x=d.index,y=d[col],name=col,mode='lines',line={'width':1}))
@@ -538,7 +626,7 @@ q3.metric('Volume',vol_label,f'{vol_ratio:.2f}x')
 q4.metric('PCR',f'{pcr_oi:.2f}' if pd.notna(pcr_oi) else 'N/A')
 q5.metric('Confirmation','YES' if live_confirmation else 'WAIT')
 
-tabs=st.tabs(['Indicators','Patterns','Backtest','Paper Trading','Market','Pre-Open','Options','News','Data'])
+tabs=st.tabs(['Indicators','Patterns','Backtest','Paper Trading','Market','Pre-Open','Options','News','Data','FII/DII & Risk','Settings'])
 with tabs[0]:
     c1,c2,c3=st.columns(3);c1.metric('EMA 5',f'{last.EMA5:.2f}');c1.metric('EMA 21',f'{last.EMA21:.2f}');c1.metric('EMA 50',f'{last.EMA50:.2f}');c2.metric('EMA 200',f'{last.EMA200:.2f}');c2.metric('BB Upper',f'{last.BB_UPPER:.2f}');c2.metric('BB Lower',f'{last.BB_LOWER:.2f}');c3.metric('Stochastic K',f'{last.STOCH_K:.2f}');c3.metric('CCI',f'{last.CCI:.2f}');c3.metric('ADX',f'{last.ADX:.2f}')
     a,b=st.columns(2)
@@ -548,17 +636,17 @@ with tabs[0]:
         f=go.Figure(go.Scatter(x=d.index,y=d.RSI,name='RSI'));f.add_hline(y=70);f.add_hline(y=30);f.update_layout(height=320,template='plotly_dark',title='RSI');st.plotly_chart(f,use_container_width=True)
     fib=d.attrs['fib'];st.subheader('Fibonacci');st.dataframe(pd.DataFrame({'Level':fib.keys(),'Price':fib.values()}),use_container_width=True,hide_index=True)
 with tabs[1]:
-    st.subheader('ðŸ•¯ï¸ Candlestick Patterns'); cp=candle_patterns(d)
+    st.subheader('Ã°Å¸â€¢Â¯Ã¯Â¸Â Candlestick Patterns'); cp=candle_patterns(d)
     if cp:
         for x in cp:st.success(x)
     else:st.info('No strong candlestick pattern detected.')
-    st.subheader('ðŸ“ Chart Patterns'); ch=chart_patterns(d)
+    st.subheader('Ã°Å¸â€œÂ Chart Patterns'); ch=chart_patterns(d)
     if ch:
         for x in ch:st.info(x)
     else:st.info('No strong chart structure detected.')
     st.caption('Pattern detection is quantitative/approximate and is not a guarantee.')
 with tabs[2]:
-    st.subheader('ðŸ§ª Strategy Backtest & Historical Win Rate')
+    st.subheader('Ã°Å¸Â§Âª Strategy Backtest & Historical Win Rate')
     bt_periods={'1 Month':'1mo','2 Months':'2mo','3 Months':'3mo','4 Months':'4mo','5 Months':'5mo','6 Months':'6mo','1 Year':'1y','5 Years':'5y'}
     bt_choice=st.selectbox('Backtest period',list(bt_periods.keys()))
     bt,stats=backtest(symbol,bt_periods[bt_choice])
@@ -580,7 +668,7 @@ with tabs[2]:
     else:
         st.warning('Not enough historical data for this backtest period.')
 
-    st.subheader('ðŸŽ¯ Current Signal Historical Win Rate')
+    st.subheader('Ã°Å¸Å½Â¯ Current Signal Historical Win Rate')
     if stats:
         current_key='BUY' if strength in ['BUY BIAS','STRONG BUY'] else 'SELL' if strength in ['SELL BIAS','STRONG SELL'] else 'NO SIGNAL'
         current_hist=stats['buy_win_rate'] if current_key=='BUY' else stats['sell_win_rate'] if current_key=='SELL' else np.nan
@@ -590,14 +678,14 @@ with tabs[2]:
         cc3.metric('Confidence Score',f"{mf_score*10}%")
         st.info('Confidence is a factor score, not a probability. Historical win rate describes past rule performance only.')
 
-    st.subheader('ðŸ“Œ Live Confirmation')
+    st.subheader('Ã°Å¸â€œÅ’ Live Confirmation')
     lc1,lc2,lc3=st.columns(3)
     lc1.metric('Volume Confirmation',vol_label,f"{vol_ratio:.2f}x avg")
     lc2.metric('PCR',f"{pcr_oi:.2f}" if pd.notna(pcr_oi) else 'N/A')
     lc3.metric('Live Confirmation', 'CONFIRMED' if live_confirmation else 'WAIT')
 
 with tabs[3]:
-    st.subheader('ðŸ“ Paper Trading')
+    st.subheader('Ã°Å¸â€œÂ Paper Trading')
     a,b,c=st.columns(3)
     with a: side=st.selectbox('Side',['BUY','SELL']);qty=st.number_input('Quantity',1.0,step=1.0);entry=st.number_input('Entry Price',0.0,value=price,step=.05)
     with b:
@@ -605,8 +693,8 @@ with tabs[3]:
         default_target=levels['Target 1'] if levels['Direction']==side and pd.notna(levels['Target 1']) else (price+2*(float(last.ATR) if pd.notna(last.ATR) else price*.01) if side=='BUY' else max(.01,price-2*(float(last.ATR) if pd.notna(last.ATR) else price*.01)))
         sl=st.number_input('Stop Loss',0.0,value=float(max(.01,default_sl)),step=.05);target=st.number_input('Target 1',0.0,value=float(max(.01,default_target)),step=.05)
     with c:
-        est=(price-entry)*qty if side=='BUY' else (entry-price)*qty;st.metric('Live P/L',f'{est:+,.2f}');st.metric('Paper Balance',f'â‚¹{st.session_state.balance:,.2f}');st.metric('Realized P/L',f'â‚¹{st.session_state.realized_pnl:+,.2f}')
-    if st.button('âž• Open Paper Position',use_container_width=True):
+        est=(price-entry)*qty if side=='BUY' else (entry-price)*qty;st.metric('Live P/L',f'{est:+,.2f}');st.metric('Paper Balance',f'Ã¢â€šÂ¹{st.session_state.balance:,.2f}');st.metric('Realized P/L',f'Ã¢â€šÂ¹{st.session_state.realized_pnl:+,.2f}')
+    if st.button('Ã¢Å¾â€¢ Open Paper Position',use_container_width=True):
         st.session_state.paper_trades.append({'Symbol':symbol,'Side':side,'Quantity':float(qty),'Entry':float(entry),'Stop Loss':float(sl),'Target':float(target),'Opened':datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'Status':'OPEN','Exit':np.nan,'Exit Time':'','Final P/L':np.nan});st.rerun()
     if st.session_state.paper_trades:
         rows=[]
@@ -617,10 +705,10 @@ with tabs[3]:
         if opens:
             i=st.selectbox('Open position to exit',opens,format_func=lambda x:f"#{x+1} {st.session_state.paper_trades[x]['Symbol']} {st.session_state.paper_trades[x]['Side']}")
             ep=st.number_input('Exit Price',0.0,value=price,step=.05)
-            if st.button('â›” Exit Selected Position',use_container_width=True):close_trade(i,ep);st.rerun()
+            if st.button('Ã¢â€ºâ€ Exit Selected Position',use_container_width=True):close_trade(i,ep);st.rerun()
     else:st.info('No paper positions.')
 with tabs[4]:
-    st.subheader('ðŸŒ Market Overview')
+    st.subheader('Ã°Å¸Å’Â Market Overview')
     tr=trend_analysis(d)
     prev_levels=previous_day_levels(symbol)
     a1,a2,a3=st.columns(3)
@@ -641,26 +729,26 @@ with tabs[4]:
     cs=st.columns(3)
     for i,(lab,sym) in enumerate(markets.items()):
         q,ch=quote(sym);cs[i%3].metric(lab,f'{q:,.2f}' if pd.notna(q) else 'N/A',f'{ch:+.2f}%' if pd.notna(ch) else None)
-    st.subheader('ðŸ“Š Advance / Decline'); rows=[];adv=dec=unch=0
+    st.subheader('Ã°Å¸â€œÅ  Advance / Decline'); rows=[];adv=dec=unch=0
     for n,s in NIFTY.items():
         q,ch=quote(s)
         if pd.notna(ch):
             status='Advance' if ch>.05 else 'Decline' if ch<-.05 else 'Unchanged';adv+=status=='Advance';dec+=status=='Decline';unch+=status=='Unchanged';rows.append({'Stock':n,'Change %':ch,'Status':status})
-    a,b,c,e=st.columns(4);a.metric('Advances',adv);b.metric('Declines',dec);c.metric('Unchanged',unch);e.metric('A/D Ratio',f'{adv/dec:.2f}' if dec else 'âˆž')
+    a,b,c,e=st.columns(4);a.metric('Advances',adv);b.metric('Declines',dec);c.metric('Unchanged',unch);e.metric('A/D Ratio',f'{adv/dec:.2f}' if dec else 'Ã¢Ë†Å¾')
     if rows:st.dataframe(pd.DataFrame(rows).sort_values('Change %',ascending=False),use_container_width=True,hide_index=True)
-    st.subheader('ðŸ“° Critical News Context')
-    st.write(f"**{news_info['bias']}** â€¢ Risk: **{news_info['risk']}** â€¢ Bull points: {news_info['bull_points']} â€¢ Bear points: {news_info['bear_points']}")
-    st.subheader('ðŸ¦ FII / DII');st.warning('Live NSE FII/DII values are not fabricated here. Use an authorized NSE/broker feed for production values.')
+    st.subheader('Ã°Å¸â€œÂ° Critical News Context')
+    st.write(f"**{news_info['bias']}** Ã¢â‚¬Â¢ Risk: **{news_info['risk']}** Ã¢â‚¬Â¢ Bull points: {news_info['bull_points']} Ã¢â‚¬Â¢ Bear points: {news_info['bear_points']}")
+    st.subheader('Ã°Å¸ÂÂ¦ FII / DII');st.warning('Live NSE FII/DII values are not fabricated here. Use an authorized NSE/broker feed for production values.')
     f1,f2=st.columns(2);f1.metric('FII','Feed required');f2.metric('DII','Feed required')
 with tabs[5]:
-    st.subheader('ðŸŒ… Pre-Open / Possible Opening Analysis')
+    st.subheader('Ã°Å¸Å’â€¦ Pre-Open / Possible Opening Analysis')
     oa=opening_analysis(symbol,d)
     if oa:
         p1,p2,p3,p4=st.columns(4)
-        p1.metric('Previous Close',f"â‚¹{oa['prev_close']:,.2f}")
-        p2.metric('Possible Open Mid',f"â‚¹{oa['estimated_mid']:,.2f}")
-        p3.metric('Possible Open Low',f"â‚¹{oa['estimated_low']:,.2f}")
-        p4.metric('Possible Open High',f"â‚¹{oa['estimated_high']:,.2f}")
+        p1.metric('Previous Close',f"Ã¢â€šÂ¹{oa['prev_close']:,.2f}")
+        p2.metric('Possible Open Mid',f"Ã¢â€šÂ¹{oa['estimated_mid']:,.2f}")
+        p3.metric('Possible Open Low',f"Ã¢â€šÂ¹{oa['estimated_low']:,.2f}")
+        p4.metric('Possible Open High',f"Ã¢â€šÂ¹{oa['estimated_high']:,.2f}")
         st.metric('Pre-Session Multifactor Bias',oa['bias'],f"Factor score {oa['factor_score']}/5")
         pre=preopen_snapshot()
         if pre:
@@ -668,12 +756,12 @@ with tabs[5]:
             st.json(pre)
         else:
             st.warning('Official NSE indicative pre-open data was not reachable from this Streamlit environment. The displayed range is an estimate from previous close/ATR and market factors, not the official equilibrium price.')
-        st.caption('NSE pre-open session is 9:00â€“9:15 IST; when an equilibrium price is discovered, it becomes the dayâ€™s open price. The app labels its fallback range as an estimate rather than official pre-open data.')
+        st.caption('NSE pre-open session is 9:00Ã¢â‚¬â€œ9:15 IST; when an equilibrium price is discovered, it becomes the dayÃ¢â‚¬â„¢s open price. The app labels its fallback range as an estimate rather than official pre-open data.')
     else:
         st.info('Pre-open analysis unavailable for this symbol.')
 
 with tabs[6]:
-    st.subheader('ðŸ§® Options Analysis')
+    st.subheader('Ã°Å¸Â§Â® Options Analysis')
     if not pcr_summary.empty:
         st.dataframe(pcr_summary,use_container_width=True,hide_index=True)
         st.metric('OI PCR',f"{pcr_oi:.2f}" if pd.notna(pcr_oi) else 'N/A')
@@ -681,7 +769,7 @@ with tabs[6]:
         st.warning('Live option-chain PCR unavailable for this symbol. Select an index/option-enabled underlying.');st.warning('PCR, OI, IV and Max Pain require a reliable live option-chain/exchange or broker feed. This dashboard does not invent those values.')
     st.selectbox('Underlying',['NIFTY','BANKNIFTY','RELIANCE','TCS','INFY','HDFCBANK']);st.info('Production integration can populate expiry, strike-wise CE/PE OI, volume, IV, PCR and Max Pain using an authorized API.')
 with tabs[7]:
-    st.subheader('ðŸ“° Market & Geopolitical News')
+    st.subheader('Ã°Å¸â€œÂ° Market & Geopolitical News')
     st.metric('Critical News Bias',news_info['bias'],f"Risk {news_info['risk']}")
     ns=news_items
     if ns:
@@ -691,7 +779,31 @@ with tabs[7]:
 with tabs[8]:
     cols=['Open','High','Low','Close','Volume','EMA5','EMA21','EMA50','EMA200','VWAP','RSI','MACD','MACD_SIGNAL','ATR','ADX','BB_UPPER','BB_MID','BB_LOWER','STOCH_K','STOCH_D','CCI','SUPPORT','RESISTANCE','PIVOT','R1','S1','R2','S2'];st.dataframe(d[[x for x in cols if x in d]].tail(50),use_container_width=True)
 
-st.divider();st.subheader('ðŸ”Œ Broker Integration')
+
+with tabs[9]:
+    st.subheader('ðŸ¦ FII / DII Activity')
+    fd=fii_dii_feed()
+    if not fd.empty:
+        st.dataframe(fd.tail(20),use_container_width=True,hide_index=True)
+        st.caption('Source: NSE endpoint when reachable. Values are shown only when the source responds; no synthetic values are generated.')
+    else:
+        st.warning('NSE FII/DII feed is unavailable from this environment. Connect an authorized broker/data feed for production reliability.')
+    st.subheader('Risk / Position Sizing')
+    rs_entry=st.number_input('Sizing Entry Price',0.01,float(levels['Entry']),0.05)
+    rs_sl=st.number_input('Sizing Stop Loss',0.01,float(levels['Stop Loss']) if pd.notna(levels['Stop Loss']) else max(0.01,price-price*0.01),0.05)
+    qty_s,risk_cash=risk_position_size(rs_entry,rs_sl,st.session_state.balance,st.session_state.risk_per_trade,st.session_state.max_position_value)
+    r1,r2,r3=st.columns(3);r1.metric('Suggested Qty',qty_s);r2.metric('Max Risk â‚¹',f'{risk_cash:,.2f}');r3.metric('Risk %',f"{st.session_state.risk_per_trade:.2f}%")
+    st.caption('Position size is a rule-based risk calculation, not a guarantee or order instruction.')
+
+with tabs[10]:
+    st.subheader('âš™ï¸ Settings & Data Controls')
+    st.write('**Login:** username `admin`; initial password is `admin123`. The demo recovery PIN defaults to `1234` unless TRADING_RECOVERY_PIN is set.')
+    st.write('**Auto refresh:** controlled from the sidebar. **Paper auto-exit:** can close positions at trailing SL/target using the current market price.')
+    if st.button('Clear Cached Market Data'):
+        st.cache_data.clear(); st.success('Cache cleared. Refresh the page to reload all feeds.')
+    st.warning('Before real trading, replace demo authentication with secure hashed credentials/session management and connect a broker API with explicit order confirmation.')
+
+st.divider();st.subheader('Ã°Å¸â€Å’ Broker Integration')
 a,b,c,e=st.columns(4);a.metric('Angel One','API Ready');b.metric('Upstox','API Ready');c.metric('Delta Exchange','API Ready');e.metric('Sahi','API Ready')
 st.caption('Paper trading is functional. Real broker order execution requires your authorized API credentials and the broker current official API/SDK contract; this app does not place real orders by itself.')
 st.info('Market data can be delayed, incomplete, or unavailable. Signals are informational and are not guaranteed investment advice.')
