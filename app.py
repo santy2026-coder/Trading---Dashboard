@@ -85,7 +85,16 @@ def indicators(d):
     delta=c.diff(); gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean(); rs=gain/loss.replace(0,np.nan); d['RSI']=100-100/(1+rs)
     e12=c.ewm(span=12,adjust=False).mean(); e26=c.ewm(span=26,adjust=False).mean(); d['MACD']=e12-e26; d['MACD_SIGNAL']=d.MACD.ewm(span=9,adjust=False).mean(); d['MACD_HIST']=d.MACD-d.MACD_SIGNAL
     pc=c.shift(1); tr=pd.concat([h-l,(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1); d['ATR']=tr.rolling(14).mean()
-    tp=(h+l+c)/3; d['VWAP']=(tp*v).cumsum()/v.cumsum().replace(0,np.nan)
+    tp=(h+l+c)/3
+    vol_sum=float(v.sum()) if len(v) else 0.0
+    if vol_sum>0:
+        d['VWAP']=(tp*v).cumsum()/v.cumsum().replace(0,np.nan)
+        d.attrs['vwap_status']='VOLUME VWAP'
+    else:
+        # Some index feeds expose no usable volume. Keep a clearly-labelled price proxy
+        # so the dashboard still has a reference level instead of a confusing NaN.
+        d['VWAP']=tp.rolling(20,min_periods=1).mean()
+        d.attrs['vwap_status']='VWAP PROXY (NO VOLUME)'
     mid=c.rolling(20).mean(); sd=c.rolling(20).std(); d['BB_MID']=mid; d['BB_UPPER']=mid+2*sd; d['BB_LOWER']=mid-2*sd
     lo=l.rolling(14).min(); hi=h.rolling(14).max(); d['STOCH_K']=100*(c-lo)/(hi-lo).replace(0,np.nan); d['STOCH_D']=d.STOCH_K.rolling(3).mean()
     tmean=tp.rolling(20).mean(); md=tp.rolling(20).apply(lambda x:np.mean(np.abs(x-np.mean(x))),raw=True); d['CCI']=(tp-tmean)/(0.015*md.replace(0,np.nan))
@@ -131,10 +140,58 @@ def chart_patterns(d):
         if middle<left*.97 and abs(right/left-1)<.05:out.append('Possible Cup & Handle')
     return list(dict.fromkeys(out))
 
-def signal(row):
+def signal(row, pattern_bias=0):
     checks=[row.Close>row.EMA5,row.EMA5>row.EMA21,row.EMA21>row.EMA50,row.EMA50>row.EMA200,row.MACD>row.MACD_SIGNAL,row.RSI>50,row.Close>row.VWAP,row.ADX>20,row.Close>row.PIVOT]
     score=sum(bool(x) for x in checks if pd.notna(x))
+    score=int(max(0,min(10,score+int(pattern_bias))))
     return ('BUY' if score>=7 else 'SELL' if score<=3 else 'WAIT'),score
+
+def candle_pattern_bias(d):
+    patterns=candle_patterns(d)
+    bullish={'Hammer','Bullish Marubozu','Bullish Engulfing','Piercing Pattern','Morning Star','Three White Soldiers','Possible Double Bottom'}
+    bearish={'Shooting Star','Bearish Marubozu','Bearish Engulfing','Dark Cloud Cover','Evening Star','Three Black Crows','Possible Double Top'}
+    bull=sum(x in bullish for x in patterns)
+    bear=sum(x in bearish for x in patterns)
+    return (1 if bull>bear else -1 if bear>bull else 0), patterns
+
+def trendline_values(d, lookback=60):
+    r=d.tail(min(lookback,len(d))).copy()
+    if len(r)<10:
+        return r.index, np.full(len(r),np.nan), np.full(len(r),np.nan), 0.0
+    x=np.arange(len(r),dtype=float)
+    hi=np.polyfit(x,r['High'].astype(float).values,1)
+    lo=np.polyfit(x,r['Low'].astype(float).values,1)
+    upper=np.polyval(hi,x); lower=np.polyval(lo,x)
+    slope=((hi[0]+lo[0])/2)/max(float(r['Close'].mean()),1e-9)*100
+    return r.index, upper, lower, slope
+
+def confidence_score(row, d, pcr, news_info, pattern_bias, trend):
+    points=0; reasons=[]
+    checks=[
+        (pd.notna(row.EMA5) and row.Close>row.EMA5,'Price above EMA5'),
+        (pd.notna(row.EMA21) and row.EMA5>row.EMA21,'EMA5 above EMA21'),
+        (pd.notna(row.EMA50) and row.EMA21>row.EMA50,'EMA21 above EMA50'),
+        (pd.notna(row.EMA200) and row.EMA50>row.EMA200,'EMA50 above EMA200'),
+        (pd.notna(row.MACD_SIGNAL) and row.MACD>row.MACD_SIGNAL,'MACD bullish'),
+        (pd.notna(row.RSI) and row.RSI>50,'RSI above 50'),
+        (pd.notna(row.VWAP) and row.Close>row.VWAP,'Price above VWAP'),
+        (pd.notna(row.PIVOT) and row.Close>row.PIVOT,'Price above pivot'),
+        (pd.notna(row.ADX) and row.ADX>20,'Trend strength ADX > 20'),
+    ]
+    for ok, label in checks:
+        if ok: points+=1; reasons.append(label)
+    if pattern_bias>0: points+=1; reasons.append('Bullish candlestick pattern')
+    elif pattern_bias<0: points-=1; reasons.append('Bearish candlestick pattern')
+    if pd.notna(pcr):
+        if pcr>1.0: points+=1; reasons.append('PCR supports bullish/put-heavy positioning')
+        elif pcr<0.8: points-=1; reasons.append('PCR supports bearish/call-heavy positioning')
+    if trend in ('STRONG UPTREND','BULLISH TREND'): points+=1; reasons.append('Trendline/trend bullish')
+    elif trend in ('STRONG DOWNTREND','BEARISH TREND'): points-=1; reasons.append('Trendline/trend bearish')
+    if news_info.get('bias')=='BULLISH NEWS BIAS': points+=1; reasons.append('News bias bullish')
+    elif news_info.get('bias')=='BEARISH NEWS BIAS': points-=1; reasons.append('News bias bearish')
+    score=int(max(0,min(100,50+points*5)))
+    return score,reasons
+
 
 @st.cache_data(ttl=60,show_spinner=False)
 def quote(sym):
@@ -220,8 +277,8 @@ def strength_from_score(score, volume_ok=True):
         return 'SELL BIAS'
     return 'NO SIGNAL'
 
-def multifactor_signal(row, d, pcr=None):
-    base_sig, score = signal(row)
+def multifactor_signal(row, d, pcr=None, pattern_bias=0):
+    base_sig, score = signal(row, pattern_bias)
     volume_label, volume_ratio = volume_confirmation(d)
     vol_ok = volume_ratio >= 1.1
     pcr_score = 0
@@ -304,56 +361,53 @@ def option_suggestions(symbol, underlying_price):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def backtest(symbol, period):
-    d = data(symbol, period, '1d')
-    if d.empty or len(d) < 80:
+    d=data(symbol, period, '1d')
+    if d.empty or len(d)<80:
         return pd.DataFrame(), {}
-    d = indicators(d).dropna(subset=['EMA5','EMA21','EMA50','EMA200','RSI','MACD','MACD_SIGNAL','VWAP','ADX','PIVOT']).copy()
-    records = []
-    for i in range(len(d) - 1):
-        r = d.iloc[i]
-        sig, score = signal(r)
-        strength = 'STRONG BUY' if score >= 8 else 'BUY' if score >= 6 else 'STRONG SELL' if score <= 1 else 'SELL' if score <= 3 else 'NO SIGNAL'
-        if sig == 'WAIT':
+    d=indicators(d).copy()
+    records=[]
+    # Historical simulation: enter on next day's open after a signal.
+    # Stop = 1 ATR, target = 2 ATR, max holding = 10 bars.
+    for i in range(60, len(d)-1):
+        hist=d.iloc[:i+1]
+        row=d.iloc[i]
+        pb,_=candle_pattern_bias(hist)
+        sig,score=signal(row,pb)
+        if sig=='WAIT':
             continue
-        nxt = float(d['Close'].iloc[i + 1])
-        cur = float(r['Close'])
-        ret = (nxt - cur) / cur if cur else 0
-        win = ret > 0 if sig == 'BUY' else ret < 0
-        records.append({
-            'Date': d.index[i], 'Signal': sig, 'Strength': strength,
-            'Score': score, 'Return %': ret * 100, 'Win': bool(win)
-        })
-    bt = pd.DataFrame(records)
-    if bt.empty:
-        return bt, {}
-    total = len(bt)
-    wins = int(bt['Win'].sum())
-    losses = total - wins
-    win_rate = wins / total * 100
-    bt['Volume Confirmed'] = bt['Date'].map(lambda dt: True)
-    buy = bt[bt['Signal'] == 'BUY']
-    sell = bt[bt['Signal'] == 'SELL']
-    # Volume confirmation is evaluated inside the backtest from the same historical bars.
-    vol = d['Volume'].rolling(20).mean()
-    vol_ratio = d['Volume'] / vol.replace(0, np.nan)
-    ratio_map = vol_ratio.to_dict()
-    bt['Volume Ratio'] = bt['Date'].map(ratio_map)
-    bt['Volume Confirmed'] = bt['Volume Ratio'] >= 1.1
-    buy_confirm = bt[(bt['Signal']=='BUY') & (bt['Volume Confirmed'])]
-    sell_confirm = bt[(bt['Signal']=='SELL') & (bt['Volume Confirmed'])]
-    stats = {
-        'signals': total, 'wins': wins, 'losses': losses, 'win_rate': win_rate,
-        'avg_return': float(bt['Return %'].mean()),
-        'buy_win_rate': float(buy['Win'].mean() * 100) if len(buy) else np.nan,
-        'sell_win_rate': float(sell['Win'].mean() * 100) if len(sell) else np.nan,
-        'buy_confirm_win_rate': float(buy_confirm['Win'].mean() * 100) if len(buy_confirm) else np.nan,
-        'sell_confirm_win_rate': float(sell_confirm['Win'].mean() * 100) if len(sell_confirm) else np.nan,
-        'strong_buy_win_rate': float(bt.loc[bt['Strength']=='STRONG BUY','Win'].mean()*100) if (bt['Strength']=='STRONG BUY').any() else np.nan,
-        'strong_sell_win_rate': float(bt.loc[bt['Strength']=='STRONG SELL','Win'].mean()*100) if (bt['Strength']=='STRONG SELL').any() else np.nan,
-        'max_drawdown_pct': float((bt['Return %'].cumsum().cummax()-bt['Return %'].cumsum()).max()) if len(bt) else 0.0,
-        'net_return_pct': float(bt['Return %'].sum()),
-    }
-    return bt, stats
+        entry=float(d['Open'].iloc[i+1])
+        atr=float(row['ATR']) if pd.notna(row['ATR']) else max(entry*0.01,0.01)
+        atr=max(atr,entry*0.001)
+        sl=entry-atr if sig=='BUY' else entry+atr
+        target=entry+2*atr if sig=='BUY' else max(0.01,entry-2*atr)
+        exit_price=float(d['Close'].iloc[min(i+10,len(d)-1)])
+        exit_date=d.index[min(i+10,len(d)-1)]
+        outcome='TIME EXIT'
+        hit_bar=None
+        for j in range(i+1,min(i+11,len(d))):
+            hi=float(d['High'].iloc[j]); lo=float(d['Low'].iloc[j])
+            if sig=='BUY':
+                # Conservative assumption if both levels are touched in one bar: SL first.
+                if lo<=sl:
+                    exit_price=sl; exit_date=d.index[j]; outcome='LOSS'; hit_bar=j; break
+                if hi>=target:
+                    exit_price=target; exit_date=d.index[j]; outcome='WIN'; hit_bar=j; break
+            else:
+                if hi>=sl:
+                    exit_price=sl; exit_date=d.index[j]; outcome='LOSS'; hit_bar=j; break
+                if lo<=target:
+                    exit_price=target; exit_date=d.index[j]; outcome='WIN'; hit_bar=j; break
+        ret=(exit_price-entry)/entry*100 if sig=='BUY' else (entry-exit_price)/entry*100
+        if outcome=='TIME EXIT': outcome='WIN' if ret>0 else 'LOSS' if ret<0 else 'FLAT'
+        records.append({'Signal Date':d.index[i],'Entry Date':d.index[i+1],'Exit Date':exit_date,'Signal':sig,'Score':score,'Entry':entry,'Stop Loss':sl,'Target':target,'Exit':exit_price,'Return %':ret,'Outcome':outcome,'Win':outcome=='WIN'})
+    bt=pd.DataFrame(records)
+    if bt.empty:return bt,{}
+    wins=int((bt['Outcome']=='WIN').sum()); losses=int((bt['Outcome']=='LOSS').sum()); flats=int((bt['Outcome']=='FLAT').sum()); total=len(bt)
+    buy=bt[bt.Signal=='BUY']; sell=bt[bt.Signal=='SELL']
+    equity=bt['Return %'].cumsum(); dd=(equity.cummax()-equity);
+    stats={'signals':total,'wins':wins,'losses':losses,'flats':flats,'win_rate':wins/total*100,'loss_rate':losses/total*100,'avg_return':float(bt['Return %'].mean()),'net_return_pct':float(bt['Return %'].sum()),'max_drawdown_pct':float(dd.max()),'buy_trades':len(buy),'sell_trades':len(sell),'buy_wins':int((buy.Outcome=='WIN').sum()),'sell_wins':int((sell.Outcome=='WIN').sum()),'buy_losses':int((buy.Outcome=='LOSS').sum()),'sell_losses':int((sell.Outcome=='LOSS').sum()),'buy_win_rate':float((buy.Outcome=='WIN').mean()*100) if len(buy) else np.nan,'sell_win_rate':float((sell.Outcome=='WIN').mean()*100) if len(sell) else np.nan}
+    return bt,stats
+
 
 @st.cache_data(ttl=60, show_spinner=False)
 def option_pcr(symbol):
@@ -581,8 +635,9 @@ auto_events=update_open_paper_positions(price)
 if auto_events:
     for ev in auto_events: st.toast(ev)
 pcr_oi, pcr_summary, pcr_status = option_pcr(symbol)
-strength, mf_score, vol_label, vol_ratio, pcr_label, live_confirmation = multifactor_signal(last, d, pcr_oi)
-sig,score=signal(last)
+pattern_bias, current_patterns = candle_pattern_bias(d)
+strength, mf_score, vol_label, vol_ratio, pcr_label, live_confirmation = multifactor_signal(last, d, pcr_oi, pattern_bias)
+sig,score=signal(last, pattern_bias)
 levels=trade_levels(price,last,strength)
 option_suggest, option_suggest_status = option_suggestions(symbol, price)
 news_items = live_news_feed(symbol, name)
@@ -591,10 +646,46 @@ trend_now = trend_analysis(d)
 prev_levels_now = previous_day_levels(symbol)
 prev_close_now = float(prev_levels_now.get('Previous Close', price)) if prev_levels_now else price
 critical = critical_market_analysis(strength, mf_score, trend_now, vol_ratio, pcr_oi, news_info, price, levels.get('Pivot',price), prev_close_now)
+confidence, confidence_reasons = confidence_score(last, d, pcr_oi, news_info, pattern_bias, trend_now)
+trend_idx, trend_upper, trend_lower, trend_slope = trendline_values(d)
 
 m=st.columns(7); m[0].metric('Live Price',fmt_price(price),fmt_num(change,2,'',''));m[1].metric('Change',fmt_pct(pct));m[2].metric('RSI',fmt_num(last.RSI));m[3].metric('MACD',fmt_num(last.MACD));m[4].metric('VWAP',fmt_price(last.VWAP));m[5].metric('ATR',fmt_num(last.ATR));m[6].metric('ADX',fmt_num(last.ADX));
 st.metric('Signal',sig,f'{strength} | Score {mf_score}/10')
-st.caption('VWAP is shown as N/A when the selected data source does not provide usable volume (common for some index feeds).')
+st.caption(f"VWAP status: {d.attrs.get('vwap_status','N/A')} | PCR status: {pcr_status}")
+
+st.subheader('[SIGNAL] Signal Quality, PCR, VWAP, Pattern and Confidence')
+q1,q2,q3,q4,q5,q6=st.columns(6)
+q1.metric('Signal',sig,f'{strength}')
+q2.metric('Confidence',f'{confidence}%')
+q3.metric('PCR (OI)',fmt_num(pcr_oi))
+q4.metric('VWAP',fmt_price(last.VWAP))
+q5.metric('Trend',trend_now)
+q6.metric('Pattern Bias','BULLISH' if pattern_bias>0 else 'BEARISH' if pattern_bias<0 else 'NEUTRAL')
+if current_patterns:
+    st.write('Candlestick patterns used in signal: **' + ', '.join(current_patterns) + '**')
+else:
+    st.write('Candlestick patterns used in signal: **No strong pattern detected**')
+st.caption('Confidence is a rule-based score, not a guaranteed probability. PCR is shown only when an option-chain feed is available; VWAP becomes a clearly-labelled proxy when volume is unavailable.')
+
+# Prominent historical backtest summary so the result is visible without opening a tab.
+summary_bt, summary_stats = backtest(symbol, '1y')
+st.subheader('[BACKTEST] 1-Year Historical Result')
+if summary_stats:
+    b1,b2,b3,b4,b5,b6=st.columns(6)
+    b1.metric('Total Trades',summary_stats['signals'])
+    b2.metric('Wins',summary_stats['wins'])
+    b3.metric('Losses',summary_stats['losses'])
+    b4.metric('Win Rate',f"{summary_stats['win_rate']:.1f}%")
+    b5.metric('Loss Rate',f"{summary_stats['loss_rate']:.1f}%")
+    b6.metric('Max Drawdown',f"{summary_stats['max_drawdown_pct']:.2f}%")
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric('BUY Trades',summary_stats['buy_trades'],f"W {summary_stats['buy_wins']} / L {summary_stats['buy_losses']}")
+    c2.metric('SELL Trades',summary_stats['sell_trades'],f"W {summary_stats['sell_wins']} / L {summary_stats['sell_losses']}")
+    c3.metric('BUY Hit Rate',f"{summary_stats['buy_win_rate']:.1f}%" if pd.notna(summary_stats['buy_win_rate']) else 'N/A')
+    c4.metric('SELL Hit Rate',f"{summary_stats['sell_win_rate']:.1f}%" if pd.notna(summary_stats['sell_win_rate']) else 'N/A')
+    st.caption('Backtest uses next-day-open entry, 1 ATR stop, 2 ATR target and up to 10 trading bars. Historical hit rate is not a future win probability.')
+else:
+    st.warning('Backtest needs at least about 80 daily candles. Select a longer chart/data period or a symbol with sufficient history.')
 
 st.subheader('[TRADE] Trade Setup - Entry / Targets / Stop Loss')
 if levels['Direction'] != 'WAIT':
@@ -620,20 +711,32 @@ if critical['factors']:
     st.write('**Factors:** ' + ' | '.join(critical['factors']))
 st.caption('Rule-based multifactor/news analysis. It is not a guaranteed prediction and does not execute real orders.')
 
-st.subheader('[OPTIONS] CALL / PUT Candidate')
-if critical['action'].startswith('CALL') and not option_suggest.empty:
-    cand=option_suggest[option_suggest['Type']=='CALL'].copy()
-    st.dataframe(cand,use_container_width=True,hide_index=True)
-elif critical['action'].startswith('PUT') and not option_suggest.empty:
-    cand=option_suggest[option_suggest['Type']=='PUT'].copy()
-    st.dataframe(cand,use_container_width=True,hide_index=True)
+st.subheader('[OPTIONS] Suggested CALL / PUT with Historical Hit Rate and Confidence')
+if not option_suggest.empty:
+    option_view=option_suggest.copy()
+    if sig=='BUY':
+        option_view=option_view[option_view['Type']=='CALL'].copy()
+    elif sig=='SELL':
+        option_view=option_view[option_view['Type']=='PUT'].copy()
+    # Map option direction to the underlying directional backtest.
+    option_view['Historical Hit Rate']=np.nan
+    option_view['Confidence']=confidence
+    for idx in option_view.index:
+        if option_view.loc[idx,'Type']=='CALL': option_view.loc[idx,'Historical Hit Rate']=summary_stats.get('buy_win_rate',np.nan) if summary_stats else np.nan
+        else: option_view.loc[idx,'Historical Hit Rate']=summary_stats.get('sell_win_rate',np.nan) if summary_stats else np.nan
+    option_view['Premium']=pd.to_numeric(option_view['Premium'],errors='coerce')
+    st.dataframe(option_view[['Type','Moneyness','Strike','Premium','Expiry','Historical Hit Rate','Confidence']],use_container_width=True,hide_index=True)
+    st.caption('Historical Hit Rate is the underlying BUY/SELL setup hit rate from the selected backtest, used as context for CALL/PUT. It is not an option-specific probability or guarantee.')
 else:
-    st.info('No clear CALL/PUT candidate. Wait for technical + volume + news confirmation, or check the Options tab for available contracts.')
+    st.warning('Option-chain data is unavailable for this symbol, so live ATM/OTM premium and PCR cannot be fabricated.')
 
 st.subheader('[DATA] Price & Indicators')
 fig=go.Figure(go.Candlestick(x=d.index,open=d.Open,high=d.High,low=d.Low,close=d.Close,name='Price'))
 for col in ['EMA5','EMA21','EMA50','EMA200','VWAP','BB_UPPER','BB_LOWER','SUPPORT','RESISTANCE','PIVOT','R1','S1']:
     if col in d:fig.add_trace(go.Scatter(x=d.index,y=d[col],name=col,mode='lines',line={'width':1}))
+if len(trend_idx):
+    fig.add_trace(go.Scatter(x=trend_idx,y=trend_upper,name='Trendline High',mode='lines',line={'width':3,'dash':'dash'}))
+    fig.add_trace(go.Scatter(x=trend_idx,y=trend_lower,name='Trendline Low',mode='lines',line={'width':3,'dash':'dash'}))
 fig.update_layout(height=620,xaxis_rangeslider_visible=False,template='plotly_dark',hovermode='x unified');st.plotly_chart(fig,use_container_width=True)
 
 # Live multi-factor dashboard strip
@@ -654,53 +757,51 @@ with tabs[0]:
         f=go.Figure(go.Scatter(x=d.index,y=d.RSI,name='RSI'));f.add_hline(y=70);f.add_hline(y=30);f.update_layout(height=320,template='plotly_dark',title='RSI');st.plotly_chart(f,use_container_width=True)
     fib=d.attrs['fib'];st.subheader('Fibonacci');st.dataframe(pd.DataFrame({'Level':fib.keys(),'Price':fib.values()}),use_container_width=True,hide_index=True)
 with tabs[1]:
-    st.subheader('[CANDLE] Candlestick Patterns'); cp=candle_patterns(d)
+    st.subheader('[CANDLE] Candlestick Patterns Used by Signal')
+    cp=candle_patterns(d)
     if cp:
-        for x in cp:st.success(x)
+        for x in cp:
+            if x in {'Hammer','Bullish Marubozu','Bullish Engulfing','Piercing Pattern','Morning Star','Three White Soldiers'}: st.success(x + ' | Bullish input')
+            elif x in {'Shooting Star','Bearish Marubozu','Bearish Engulfing','Dark Cloud Cover','Evening Star','Three Black Crows'}: st.error(x + ' | Bearish input')
+            else: st.info(x)
     else:st.info('No strong candlestick pattern detected.')
+    st.metric('Current Pattern Bias','BULLISH' if pattern_bias>0 else 'BEARISH' if pattern_bias<0 else 'NEUTRAL')
     st.subheader('[PATTERN] Chart Patterns'); ch=chart_patterns(d)
     if ch:
         for x in ch:st.info(x)
     else:st.info('No strong chart structure detected.')
-    st.caption('Pattern detection is quantitative/approximate and is not a guarantee.')
+    st.subheader('[TRENDLINE] Trendline Analysis')
+    st.write(f'Trendline slope: {trend_slope:+.4f}% per bar')
+    st.caption('Trendline highs/lows are drawn directly on the main price chart and the current candlestick pattern bias is included in the live signal score.')
 with tabs[2]:
-    st.subheader('[ANALYSIS]? Strategy Backtest & Historical Win Rate')
-    bt_periods={'1 Month':'1mo','2 Months':'2mo','3 Months':'3mo','4 Months':'4mo','5 Months':'5mo','6 Months':'6mo','1 Year':'1y','5 Years':'5y'}
-    bt_choice=st.selectbox('Backtest period',list(bt_periods.keys()))
+    st.subheader('[BACKTEST] Detailed Win / Loss Result')
+    bt_periods={'1 Month':'1mo','2 Months':'2mo','3 Months':'3mo','6 Months':'6mo','1 Year':'1y','2 Years':'2y','5 Years':'5y'}
+    bt_choice=st.selectbox('Backtest period',list(bt_periods.keys()),index=4)
     bt,stats=backtest(symbol,bt_periods[bt_choice])
     if stats:
-        b1,b2,b3,b4,b5=st.columns(5)
-        b1.metric('Historical Win Rate',f"{stats['win_rate']:.2f}%")
-        b2.metric('Signals',stats['signals'])
-        b3.metric('BUY Win Rate',f"{stats['buy_win_rate']:.2f}%" if pd.notna(stats['buy_win_rate']) else 'N/A')
-        b4.metric('SELL Win Rate',f"{stats['sell_win_rate']:.2f}%" if pd.notna(stats['sell_win_rate']) else 'N/A')
-        b5.metric('Avg Next-Bar Return',f"{stats['avg_return']:.2f}%")
-        bc1,bc2=st.columns(2)
-        bc1.metric('BUY + Volume Confirm Win Rate',f"{stats['buy_confirm_win_rate']:.2f}%" if pd.notna(stats['buy_confirm_win_rate']) else 'N/A')
-        bc2.metric('SELL + Volume Confirm Win Rate',f"{stats['sell_confirm_win_rate']:.2f}%" if pd.notna(stats['sell_confirm_win_rate']) else 'N/A')
-        x1,x2=st.columns(2)
-        x1.metric('Strong BUY Historical Win Rate',f"{stats['strong_buy_win_rate']:.2f}%" if pd.notna(stats['strong_buy_win_rate']) else 'N/A')
-        x2.metric('Strong SELL Historical Win Rate',f"{stats['strong_sell_win_rate']:.2f}%" if pd.notna(stats['strong_sell_win_rate']) else 'N/A')
-        st.dataframe(bt.tail(200),use_container_width=True,hide_index=True)
-        st.caption('These are historical hit rates of the rule-based next-bar test over the selected period, not a forecast or guarantee of future win probability.')
+        b1,b2,b3,b4,b5,b6=st.columns(6)
+        b1.metric('Total Trades',stats['signals'])
+        b2.metric('Wins',stats['wins'])
+        b3.metric('Losses',stats['losses'])
+        b4.metric('Win Rate',f"{stats['win_rate']:.2f}%")
+        b5.metric('Loss Rate',f"{stats['loss_rate']:.2f}%")
+        b6.metric('Max Drawdown',f"{stats['max_drawdown_pct']:.2f}%")
+        x1,x2,x3,x4=st.columns(4)
+        x1.metric('BUY W / L',f"{stats['buy_wins']} / {stats['buy_losses']}")
+        x2.metric('SELL W / L',f"{stats['sell_wins']} / {stats['sell_losses']}")
+        x3.metric('BUY Hit Rate',f"{stats['buy_win_rate']:.2f}%" if pd.notna(stats['buy_win_rate']) else 'N/A')
+        x4.metric('SELL Hit Rate',f"{stats['sell_win_rate']:.2f}%" if pd.notna(stats['sell_win_rate']) else 'N/A')
+        st.dataframe(bt.tail(300),use_container_width=True,hide_index=True)
+        st.caption('Historical simulation only. Entry is next-day open; risk model uses 1 ATR stop and 2 ATR target with a 10-bar maximum holding period.')
     else:
         st.warning('Not enough historical data for this backtest period.')
 
-    st.subheader('[TRADE] Current Signal Historical Win Rate')
-    if stats:
-        current_key='BUY' if strength in ['BUY BIAS','STRONG BUY'] else 'SELL' if strength in ['SELL BIAS','STRONG SELL'] else 'NO SIGNAL'
-        current_hist=stats['buy_win_rate'] if current_key=='BUY' else stats['sell_win_rate'] if current_key=='SELL' else np.nan
-        cc1,cc2,cc3=st.columns(3)
-        cc1.metric('Current Signal',strength)
-        cc2.metric('Historical Win Rate',f"{current_hist:.2f}%" if pd.notna(current_hist) else 'N/A')
-        cc3.metric('Confidence Score',f"{mf_score*10}%")
-        st.info('Confidence is a factor score, not a probability. Historical win rate describes past rule performance only.')
-
-    st.subheader('[INFO] Live Confirmation')
-    lc1,lc2,lc3=st.columns(3)
-    lc1.metric('Volume Confirmation',vol_label,f"{vol_ratio:.2f}x avg")
-    lc2.metric('PCR',f"{pcr_oi:.2f}" if pd.notna(pcr_oi) else 'N/A')
-    lc3.metric('Live Confirmation', 'CONFIRMED' if live_confirmation else 'WAIT')
+    st.subheader('[CONFIDENCE] Current Setup')
+    cc1,cc2,cc3=st.columns(3)
+    cc1.metric('Current Signal',sig)
+    cc2.metric('Confidence',f'{confidence}%')
+    cc3.metric('Historical Direction Hit Rate',f"{summary_stats.get('buy_win_rate' if sig=='BUY' else 'sell_win_rate',np.nan):.2f}%" if summary_stats and pd.notna(summary_stats.get('buy_win_rate' if sig=='BUY' else 'sell_win_rate',np.nan)) else 'N/A')
+    st.write('Why:', ' | '.join(confidence_reasons[:10]) if confidence_reasons else 'No strong confirming factors')
 
 with tabs[3]:
     st.subheader('[PAPER] Paper Trading')
