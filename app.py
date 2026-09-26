@@ -31,7 +31,8 @@ def fmt_num(value, decimals=2, prefix="", suffix=""):
         return "N/A"
 
 def fmt_price(value):
-    return fmt_num(value, 2, "Rs. ")
+    # Keep price cells numeric-looking without a currency symbol, per dashboard UI requirement.
+    return fmt_num(value, 2)
 
 def fmt_pct(value):
     return fmt_num(value, 2, "", "%")
@@ -68,6 +69,7 @@ NIFTY = {
 'RELIANCE':'RELIANCE.NS','TCS':'TCS.NS','INFY':'INFY.NS','HDFCBANK':'HDFCBANK.NS','ICICIBANK':'ICICIBANK.NS','SBIN':'SBIN.NS','ITC':'ITC.NS','BHARTIARTL':'BHARTIARTL.NS','TATAMOTORS':'TATAMOTORS.NS','LT':'LT.NS','AXISBANK':'AXISBANK.NS','KOTAKBANK':'KOTAKBANK.NS','HINDUNILVR':'HINDUNILVR.NS','MARUTI':'MARUTI.NS','SUNPHARMA':'SUNPHARMA.NS','M&M':'M&M.NS','TITAN':'TITAN.NS','BAJFINANCE':'BAJFINANCE.NS','BAJAJFINSV':'BAJAJFINSV.NS','ADANIENT':'ADANIENT.NS','ADANIPORTS':'ADANIPORTS.NS','ASIANPAINT':'ASIANPAINT.NS','ULTRACEMCO':'ULTRACEMCO.NS','WIPRO':'WIPRO.NS','HCLTECH':'HCLTECH.NS','TECHM':'TECHM.NS','NTPC':'NTPC.NS','POWERGRID':'POWERGRID.NS','ONGC':'ONGC.NS','COALINDIA':'COALINDIA.NS','JSWSTEEL':'JSWSTEEL.NS','TATASTEEL':'TATASTEEL.NS','HINDALCO':'HINDALCO.NS','EICHERMOT':'EICHERMOT.NS','HEROMOTOCO':'HEROMOTOCO.NS','DRREDDY':'DRREDDY.NS','CIPLA':'CIPLA.NS','APOLLOHOSP':'APOLLOHOSP.NS','NESTLEIND':'NESTLEIND.NS','TRENT':'TRENT.NS','BEL':'BEL.NS','SHRIRAMFIN':'SHRIRAMFIN.NS'}
 CRYPTO = {'BTC / USD':'BTC-USD','ETH / USD':'ETH-USD','SOL / USD':'SOL-USD','BNB / USD':'BNB-USD','XRP / USD':'XRP-USD','DOGE / USD':'DOGE-USD','ADA / USD':'ADA-USD','AVAX / USD':'AVAX-USD'}
 INDEXES = {'NIFTY 50':'^NSEI','BANK NIFTY':'^NSEBANK','SENSEX':'^BSESN','NIFTY IT':'^CNXIT','NIFTY AUTO':'^CNXAUTO','NIFTY PHARMA':'^CNXPHARMA'}
+TOP10_MONITOR = {'RELIANCE':'RELIANCE.NS','TCS':'TCS.NS','HDFCBANK':'HDFCBANK.NS','ICICIBANK':'ICICIBANK.NS','INFY':'INFY.NS','BHARTIARTL':'BHARTIARTL.NS','SBIN':'SBIN.NS','LT':'LT.NS','ITC':'ITC.NS','HINDUNILVR':'HINDUNILVR.NS'}
 
 @st.cache_data(ttl=30, show_spinner=False)
 def data(symbol, period, interval):
@@ -77,6 +79,43 @@ def data(symbol, period, interval):
         if isinstance(d.columns,pd.MultiIndex): d.columns=d.columns.get_level_values(0)
         return d.dropna(subset=['Open','High','Low','Close']).copy()
     except Exception:return pd.DataFrame()
+
+@st.cache_data(ttl=30, show_spinner=False)
+def crypto_24h_quote(sym):
+    """24-hour rolling change for 24/7 crypto markets."""
+    try:
+        d=yf.download(sym,period='2d',interval='5m',auto_adjust=False,progress=False,threads=False)
+        if d is None or d.empty: return np.nan,np.nan
+        if isinstance(d.columns,pd.MultiIndex): d.columns=d.columns.get_level_values(0)
+        d=d.dropna(subset=['Close'])
+        if len(d)<2: return np.nan,np.nan
+        last_ts=d.index[-1]
+        last=float(d['Close'].iloc[-1])
+        target=last_ts-pd.Timedelta(hours=24)
+        idx=int(np.argmin(np.abs(d.index-target)))
+        base=float(d['Close'].iloc[idx])
+        return last, ((last-base)/base*100 if base else np.nan)
+    except Exception:
+        return np.nan,np.nan
+
+@st.cache_data(ttl=30, show_spinner=False)
+def macro_snapshot():
+    out={}
+    for label,sym in [('USD/INR','INR=X'),('Crude Oil','CL=F'),('Gold','GC=F'),('India VIX','^INDIAVIX'),('S&P 500','^GSPC'),('Nasdaq','^IXIC'),('Dow Jones','^DJI')]:
+        q,ch=quote(sym)
+        out[label]={'price':q,'change':ch}
+    return out
+
+@st.cache_data(ttl=60, show_spinner=False)
+def top10_performance():
+    rows=[]
+    for name,sym in TOP10_MONITOR.items():
+        q,ch=quote(sym)
+        rows.append({'Company':name,'Price':q,'Change %':ch,'Status':'UP' if pd.notna(ch) and ch>0.05 else 'DOWN' if pd.notna(ch) and ch<-0.05 else 'FLAT'})
+    return pd.DataFrame(rows)
+
+def macro_news_queries():
+    return ['India government support sector announcement infrastructure defence semiconductor renewable energy','India RBI government policy market announcement','India major company earnings order win capex announcement','India crude oil rupee FII DII market']
 
 def indicators(d):
     d=d.copy(); c=d.Close.astype(float); h=d.High.astype(float); l=d.Low.astype(float); v=d.Volume.fillna(0).astype(float)
@@ -165,32 +204,44 @@ def trendline_values(d, lookback=60):
     slope=((hi[0]+lo[0])/2)/max(float(r['Close'].mean()),1e-9)*100
     return r.index, upper, lower, slope
 
-def confidence_score(row, d, pcr, news_info, pattern_bias, trend):
+def confidence_score(row, d, pcr, news_info, pattern_bias, trend, historical_hit_rate=np.nan, macro_score=0, institutional_score=0, basket_score=0, direction='WAIT'):
     points=0; reasons=[]
+    bullish = direction == 'BUY'; bearish = direction == 'SELL'
     checks=[
-        (pd.notna(row.EMA5) and row.Close>row.EMA5,'Price above EMA5'),
-        (pd.notna(row.EMA21) and row.EMA5>row.EMA21,'EMA5 above EMA21'),
-        (pd.notna(row.EMA50) and row.EMA21>row.EMA50,'EMA21 above EMA50'),
-        (pd.notna(row.EMA200) and row.EMA50>row.EMA200,'EMA50 above EMA200'),
-        (pd.notna(row.MACD_SIGNAL) and row.MACD>row.MACD_SIGNAL,'MACD bullish'),
-        (pd.notna(row.RSI) and row.RSI>50,'RSI above 50'),
-        (pd.notna(row.VWAP) and row.Close>row.VWAP,'Price above VWAP'),
-        (pd.notna(row.PIVOT) and row.Close>row.PIVOT,'Price above pivot'),
-        (pd.notna(row.ADX) and row.ADX>20,'Trend strength ADX > 20'),
+        (((row.Close>row.EMA5) if bullish else (row.Close<row.EMA5) if bearish else False), 'Price/EMA5 aligned'),
+        (((row.EMA5>row.EMA21) if bullish else (row.EMA5<row.EMA21) if bearish else False), 'EMA5/EMA21 aligned'),
+        (((row.EMA21>row.EMA50) if bullish else (row.EMA21<row.EMA50) if bearish else False), 'EMA21/EMA50 aligned'),
+        (((row.EMA50>row.EMA200) if bullish else (row.EMA50<row.EMA200) if bearish else False), 'EMA50/EMA200 aligned'),
+        (((row.MACD>row.MACD_SIGNAL) if bullish else (row.MACD<row.MACD_SIGNAL) if bearish else False), 'MACD aligned'),
+        (((row.RSI>50) if bullish else (row.RSI<50) if bearish else False), 'RSI aligned'),
+        (((row.Close>row.VWAP) if bullish else (row.Close<row.VWAP) if bearish else False), 'VWAP aligned'),
+        (((row.Close>row.PIVOT) if bullish else (row.Close<row.PIVOT) if bearish else False), 'Pivot aligned'),
+        (pd.notna(row.ADX) and row.ADX>20, 'Trend strength ADX > 20'),
     ]
-    for ok, label in checks:
+    for ok,label in checks:
         if ok: points+=1; reasons.append(label)
-    if pattern_bias>0: points+=1; reasons.append('Bullish candlestick pattern')
-    elif pattern_bias<0: points-=1; reasons.append('Bearish candlestick pattern')
+    if pattern_bias>0 and bullish: points+=1; reasons.append('Bullish candlestick pattern')
+    elif pattern_bias<0 and bearish: points+=1; reasons.append('Bearish candlestick pattern')
+    elif pattern_bias!=0 and direction!='WAIT': points-=1; reasons.append('Candlestick pattern conflicts with signal')
     if pd.notna(pcr):
-        if pcr>1.0: points+=1; reasons.append('PCR supports bullish/put-heavy positioning')
-        elif pcr<0.8: points-=1; reasons.append('PCR supports bearish/call-heavy positioning')
-    if trend in ('STRONG UPTREND','BULLISH TREND'): points+=1; reasons.append('Trendline/trend bullish')
-    elif trend in ('STRONG DOWNTREND','BEARISH TREND'): points-=1; reasons.append('Trendline/trend bearish')
-    if news_info.get('bias')=='BULLISH NEWS BIAS': points+=1; reasons.append('News bias bullish')
-    elif news_info.get('bias')=='BEARISH NEWS BIAS': points-=1; reasons.append('News bias bearish')
-    score=int(max(0,min(100,50+points*5)))
-    return score,reasons
+        if (pcr>1.0 and bullish) or (pcr<0.8 and bearish): points+=1; reasons.append('PCR aligned')
+        elif (pcr>1.0 and bearish) or (pcr<0.8 and bullish): points-=1; reasons.append('PCR conflicts with signal')
+    trend_bull=trend in ('STRONG UPTREND','BULLISH TREND'); trend_bear=trend in ('STRONG DOWNTREND','BEARISH TREND')
+    if (trend_bull and bullish) or (trend_bear and bearish): points+=1; reasons.append('Trendline/trend aligned')
+    elif (trend_bull or trend_bear) and direction!='WAIT': points-=1; reasons.append('Trend conflicts with signal')
+    news_bull=news_info.get('bias')=='BULLISH NEWS BIAS'; news_bear=news_info.get('bias')=='BEARISH NEWS BIAS'
+    if (news_bull and bullish) or (news_bear and bearish): points+=1; reasons.append('News aligned')
+    elif (news_bull or news_bear) and direction!='WAIT': points-=1; reasons.append('News conflicts with signal')
+    technical=int(max(0,min(100,50+points*4)))
+    if pd.notna(historical_hit_rate):
+        confidence=0.60*technical+0.40*float(historical_hit_rate)
+        reasons.append(f'Historical directional hit rate {float(historical_hit_rate):.1f}%')
+    else:
+        confidence=min(85,technical)
+        reasons.append('Historical hit rate unavailable; confidence capped at 85%')
+    confidence += max(-5,min(5,macro_score)) + max(-5,min(5,institutional_score)) + max(-5,min(5,basket_score))
+    confidence=int(round(max(0,min(95,confidence))))
+    return confidence,reasons
 
 
 @st.cache_data(ttl=60,show_spinner=False)
@@ -299,6 +350,26 @@ def multifactor_signal(row, d, pcr=None, pattern_bias=0):
 
 
 
+def enhanced_signal(base_sig, base_score, pattern_bias, news_info, macro_score, institutional_score, basket_score, pcr):
+    score=float(base_score)
+    if news_info.get('bias')=='BULLISH NEWS BIAS': score += 0.5
+    elif news_info.get('bias')=='BEARISH NEWS BIAS': score -= 0.5
+    score += max(-1.0,min(1.0,float(macro_score)*0.5))
+    score += max(-1.0,min(1.0,float(institutional_score)*0.5))
+    score += max(-0.5,min(0.5,float(basket_score)*0.5))
+    if pd.notna(pcr):
+        if pcr>1.05: score += 0.5
+        elif pcr<0.75: score -= 0.5
+    if pattern_bias>0: score += 0.5
+    elif pattern_bias<0: score -= 0.5
+    score=max(0,min(10,score))
+    if score>=7.5: sig='BUY'
+    elif score<=2.5: sig='SELL'
+    else: sig='WAIT'
+    strength='STRONG BUY' if score>=8.5 else 'BUY BIAS' if score>=6.5 else 'STRONG SELL' if score<=1.5 else 'SELL BIAS' if score<=3.5 else 'NO SIGNAL'
+    confirmation=(sig in ('BUY','SELL') and abs(score-5)>=2.0)
+    return sig,round(score,1),strength,confirmation
+
 def trade_levels(price, row, strength):
     """Rule-based entry, SL, targets and dynamic trailing stop from live price/ATR/structure."""
     atr=float(row.get('ATR', np.nan)) if pd.notna(row.get('ATR', np.nan)) else price*0.01
@@ -373,6 +444,11 @@ def backtest(symbol, period):
         row=d.iloc[i]
         pb,_=candle_pattern_bias(hist)
         sig,score=signal(row,pb)
+        trend=trend_analysis(hist) if len(hist)>=30 else 'MIXED / TRANSITION'
+        if sig=='BUY' and trend not in ('STRONG UPTREND','BULLISH TREND'): sig='WAIT'
+        if sig=='SELL' and trend not in ('STRONG DOWNTREND','BEARISH TREND'): sig='WAIT'
+        if sig=='BUY' and score<7: sig='WAIT'
+        if sig=='SELL' and score>3: sig='WAIT'
         if sig=='WAIT':
             continue
         entry=float(d['Open'].iloc[i+1])
@@ -478,7 +554,7 @@ def opening_analysis(sym, d):
 @st.cache_data(ttl=90, show_spinner=False)
 def live_news_feed(symbol, name):
     """Fetch recent Yahoo Finance search news for the selected instrument and India/global risk themes."""
-    queries = [name, f"{name} India stock market", "India markets RBI Fed crude oil geopolitical"]
+    queries = [name, f"{name} India stock market", "India markets RBI Fed crude oil geopolitical", "India government support sector infrastructure defence semiconductor renewable energy", "India major company earnings order capex announcement"]
     out=[]; seen=set()
     headers={'User-Agent':'Mozilla/5.0'}
     for q in queries:
@@ -497,8 +573,8 @@ def live_news_feed(symbol, name):
 
 def critical_news_analysis(items):
     """Transparent keyword-based news risk/bias classifier; not an AI probability forecast."""
-    bull=['beat','upgrade','buyback','growth','profit','surge','rally','strong demand','positive','approval','order win','capex']
-    bear=['downgrade','miss','loss','fraud','default','war','sanction','attack','tariff','recession','inflation','rate hike','selloff','fall','drop','weak demand','geopolitical','conflict','crisis','strike','ban']
+    bull=['beat','upgrade','buyback','growth','profit','surge','rally','strong demand','positive','approval','order win','capex','government support','support package','incentive','pli','subsidy','allocation','tender win','contract win','policy support','investment']
+    bear=['downgrade','miss','loss','fraud','default','war','sanction','attack','tariff','recession','inflation','rate hike','selloff','fall','drop','weak demand','geopolitical','conflict','crisis','strike','ban','restriction','tax hike']
     risk=['war','sanction','tariff','attack','conflict','geopolitical','crude','oil','inflation','rbi','fed','rate','recession','election','default']
     bs=rs=0; rows=[]
     for x in items:
@@ -566,6 +642,27 @@ def fii_dii_feed():
     except Exception:
         return pd.DataFrame()
 
+def institutional_bias(fd):
+    """Extract a cautious FII/DII directional score from whatever column names NSE returns."""
+    if fd is None or fd.empty: return 0,'FII/DII unavailable'
+    text=' '.join(map(str,fd.columns)).lower()
+    try:
+        row=fd.iloc[-1]
+        def val(keys):
+            for c in fd.columns:
+                lc=str(c).lower().replace(' ','')
+                if any(k in lc for k in keys):
+                    x=pd.to_numeric(row[c],errors='coerce')
+                    if pd.notna(x): return float(x)
+            return np.nan
+        fii_net=val(['fii_net','fii/fpi_net','fpi_net','net_fii','netfii'])
+        dii_net=val(['dii_net','net_dii','netdii'])
+        if pd.notna(fii_net) and pd.notna(dii_net):
+            score=(1 if fii_net>0 else -1)+(1 if dii_net>0 else -1)
+            return score,f'FII net {fii_net:.0f}; DII net {dii_net:.0f}'
+    except Exception: pass
+    return 0,'FII/DII columns not recognized'
+
 def risk_position_size(entry, stop, balance, risk_pct, max_value):
     try:
         risk_cash=max(0,float(balance))*max(0,float(risk_pct))/100.0
@@ -604,7 +701,7 @@ status, ist_now = market_status()
 st.sidebar.info(f'**Market:** {status}\n\n{ist_now}')
 st.sidebar.subheader('Risk Controls')
 st.session_state.risk_per_trade = st.sidebar.number_input('Risk / Trade %', 0.1, 10.0, float(st.session_state.risk_per_trade), 0.1)
-st.session_state.max_position_value = st.sidebar.number_input('Max Position Value Rs. ', 1000.0, 10000000.0, float(st.session_state.max_position_value), 1000.0)
+st.session_state.max_position_value = st.sidebar.number_input('Max Position Value', 1000.0, 10000000.0, float(st.session_state.max_position_value), 1000.0)
 st.session_state.auto_exit = st.sidebar.toggle('Paper Auto SL/Target/Trailing', value=st.session_state.auto_exit)
 auto_refresh = st.sidebar.toggle('[AUTO] Auto Refresh', value=False, help='Refresh live data automatically')
 refresh_seconds = st.sidebar.selectbox('Refresh Interval', [15,30,60,120,300], index=2, format_func=lambda x:f'{x} seconds', disabled=not auto_refresh)
@@ -617,20 +714,36 @@ if asset=='NSE Stocks': name=st.sidebar.selectbox('Stock',list(NIFTY)); symbol=N
 elif asset=='Indices': name=st.sidebar.selectbox('Index',list(INDEXES)); symbol=INDEXES[name]
 elif asset=='Crypto': name=st.sidebar.selectbox('Crypto',list(CRYPTO)); symbol=CRYPTO[name]
 else: symbol=st.sidebar.text_input('Custom Yahoo Symbol','RELIANCE.NS').upper().strip(); name=symbol
+chart_mode=st.sidebar.radio('Chart Mode',['Current Live','Historical'],horizontal=True)
 periods={'1 Day':'1d','5 Days':'5d','1 Month':'1mo','3 Months':'3mo','6 Months':'6mo','1 Year':'1y','2 Years':'2y','5 Years':'5y'}
 period_name=st.sidebar.selectbox('Chart Period',list(periods),index=2)
 ints={'5 Minutes':'5m','15 Minutes':'15m','30 Minutes':'30m','1 Hour':'60m','Daily':'1d'}
 int_name=st.sidebar.selectbox('Timeframe',list(ints),index=1)
+# Yahoo limits intraday history; automatically fall back to daily candles for long historical ranges.
+selected_interval=ints[int_name]
+if chart_mode=='Current Live':
+    fetch_period='2d' if asset=='Crypto' else '1d'
+else:
+    fetch_period=periods[period_name]
+    if selected_interval in ('5m','15m','30m') and fetch_period in ('3mo','6mo','1y','2y','5y'):
+        selected_interval='1d'
+        st.sidebar.info('Long historical range uses Daily candles because intraday history is provider-limited.')
+
 if st.sidebar.button('[REFRESH] Refresh Data',use_container_width=True):st.cache_data.clear();st.rerun()
 if st.sidebar.button('[LOGOUT] Logout',use_container_width=True):st.session_state.logged_in=False;st.rerun()
 
 # ---------------- MAIN ----------------
 st.title('[CHART] Advanced Trading Dashboard')
-st.caption(f'{name} | {symbol} | {int_name} | {datetime.now().strftime("%H:%M:%S")} | Auto Refresh: {"ON" if auto_refresh else "OFF"}')
-d=data(symbol,periods[period_name],ints[int_name])
+st.caption(f'{name} | {symbol} | {selected_interval} | {chart_mode} | {datetime.now().strftime("%H:%M:%S")} | Auto Refresh: {"ON" if auto_refresh else "OFF"}')
+d=data(symbol,fetch_period,selected_interval)
 if d.empty:st.error('Data unavailable. Try another symbol or Daily timeframe.');st.stop()
 d=indicators(d); last=d.iloc[-1]; prev=d.iloc[-2] if len(d)>1 else last
 price=float(last.Close); change=price-float(prev.Close); pct=change/float(prev.Close)*100 if prev.Close else 0
+if asset=='Crypto':
+    cprice,cpct=crypto_24h_quote(symbol)
+    if pd.notna(cprice):
+        price=float(cprice); pct=float(cpct) if pd.notna(cpct) else pct; change=price*(pct/100)
+
 auto_events=update_open_paper_positions(price)
 if auto_events:
     for ev in auto_events: st.toast(ev)
@@ -646,7 +759,35 @@ trend_now = trend_analysis(d)
 prev_levels_now = previous_day_levels(symbol)
 prev_close_now = float(prev_levels_now.get('Previous Close', price)) if prev_levels_now else price
 critical = critical_market_analysis(strength, mf_score, trend_now, vol_ratio, pcr_oi, news_info, price, levels.get('Pivot',price), prev_close_now)
-confidence, confidence_reasons = confidence_score(last, d, pcr_oi, news_info, pattern_bias, trend_now)
+summary_bt, summary_stats = backtest(symbol, '1y')
+
+# Pull macro, institutional and top-company context before final signal confidence.
+macro=macro_snapshot()
+fd_live=fii_dii_feed()
+institutional_score,institutional_text=institutional_bias(fd_live)
+basket=top10_performance()
+basket_score=0
+if not basket.empty:
+    valid=basket['Change %'].dropna()
+    if len(valid): basket_score=1 if valid.mean()>0.15 else -1 if valid.mean()<-0.15 else 0
+macro_score=0
+for key in ('USD/INR','Crude Oil'):
+    ch=macro.get(key,{}).get('change',np.nan)
+    if pd.notna(ch):
+        # Stronger INR can support equities; higher crude is generally a headwind for India.
+        macro_score += (-1 if key=='USD/INR' and ch>0.2 else 1 if key=='USD/INR' and ch<-0.2 else 0)
+        macro_score += (-1 if key=='Crude Oil' and ch>0.8 else 1 if key=='Crude Oil' and ch<-0.8 else 0)
+# Final signal is issued only after technical + candle + PCR + news + macro + FII/DII + top-company context.
+sig,mf_score,strength,live_confirmation=enhanced_signal(sig, mf_score, pattern_bias, news_info, macro_score, institutional_score, basket_score, pcr_oi)
+score=mf_score
+levels=trade_levels(price,last,strength)
+option_suggest, option_suggest_status = option_suggestions(symbol, price)
+hit_rate=summary_stats.get('buy_win_rate' if sig=='BUY' else 'sell_win_rate',np.nan) if 'summary_stats' in globals() else np.nan
+confidence, confidence_reasons = confidence_score(last, d, pcr_oi, news_info, pattern_bias, trend_now, hit_rate, macro_score, institutional_score, basket_score, sig)
+# Avoid a high-confidence label when the observed historical hit rate is weak.
+if pd.notna(hit_rate) and float(hit_rate)<50:
+    confidence=min(confidence,60)
+    confidence_reasons.append('Historical hit rate below 50%; confidence capped at 60%')
 trend_idx, trend_upper, trend_lower, trend_slope = trendline_values(d)
 
 m=st.columns(7); m[0].metric('Live Price',fmt_price(price),fmt_num(change,2,'',''));m[1].metric('Change',fmt_pct(pct));m[2].metric('RSI',fmt_num(last.RSI));m[3].metric('MACD',fmt_num(last.MACD));m[4].metric('VWAP',fmt_price(last.VWAP));m[5].metric('ATR',fmt_num(last.ATR));m[6].metric('ADX',fmt_num(last.ADX));
@@ -668,7 +809,6 @@ else:
 st.caption('Confidence is a rule-based score, not a guaranteed probability. PCR is shown only when an option-chain feed is available; VWAP becomes a clearly-labelled proxy when volume is unavailable.')
 
 # Prominent historical backtest summary so the result is visible without opening a tab.
-summary_bt, summary_stats = backtest(symbol, '1y')
 st.subheader('[BACKTEST] 1-Year Historical Result')
 if summary_stats:
     b1,b2,b3,b4,b5,b6=st.columns(6)
@@ -709,6 +849,7 @@ cd.metric('News Risk', news_info['risk'])
 ce.metric('Headline Count', len(news_items))
 if critical['factors']:
     st.write('**Factors:** ' + ' | '.join(critical['factors']))
+st.write(f'**Macro / Institutional confirmation:** {institutional_text} | Basket bias: {basket_score:+d} | Macro score: {macro_score:+d}')
 st.caption('Rule-based multifactor/news analysis. It is not a guaranteed prediction and does not execute real orders.')
 
 st.subheader('[OPTIONS] Suggested CALL / PUT with Historical Hit Rate and Confidence')
@@ -721,15 +862,27 @@ if not option_suggest.empty:
     # Map option direction to the underlying directional backtest.
     option_view['Historical Hit Rate']=np.nan
     option_view['Confidence']=confidence
+    option_view['Win Chance (historical)']=option_view['Historical Hit Rate']
     for idx in option_view.index:
         if option_view.loc[idx,'Type']=='CALL': option_view.loc[idx,'Historical Hit Rate']=summary_stats.get('buy_win_rate',np.nan) if summary_stats else np.nan
         else: option_view.loc[idx,'Historical Hit Rate']=summary_stats.get('sell_win_rate',np.nan) if summary_stats else np.nan
     option_view['Premium']=pd.to_numeric(option_view['Premium'],errors='coerce')
-    st.dataframe(option_view[['Type','Moneyness','Strike','Premium','Expiry','Historical Hit Rate','Confidence']],use_container_width=True,hide_index=True)
+    st.dataframe(option_view[['Type','Moneyness','Strike','Premium','Expiry','Historical Hit Rate','Win Chance (historical)','Confidence']],use_container_width=True,hide_index=True)
     st.caption('Historical Hit Rate is the underlying BUY/SELL setup hit rate from the selected backtest, used as context for CALL/PUT. It is not an option-specific probability or guarantee.')
 else:
     st.warning('Option-chain data is unavailable for this symbol, so live ATM/OTM premium and PCR cannot be fabricated.')
 
+st.subheader('[MACRO] Live Macro + Institutional + Top Company Context')
+mc=st.columns(6)
+for i,key in enumerate(['USD/INR','Crude Oil','India VIX','S&P 500','Nasdaq','Dow Jones']):
+    obj=macro.get(key,{})
+    mc[i].metric(key,fmt_num(obj.get('price')),fmt_pct(obj.get('change')))
+st.write(f'**FII/DII:** {institutional_text}')
+if not basket.empty:
+    st.dataframe(basket,use_container_width=True,hide_index=True)
+
+st.subheader('[GOV/NEWS] Government, Sector and Major Company Announcements')
+st.caption('Government policy, sector support, major company announcements and geopolitical headlines are included in the news feed and critical analysis when the provider returns them.')
 st.subheader('[DATA] Price & Indicators')
 fig=go.Figure(go.Candlestick(x=d.index,open=d.Open,high=d.High,low=d.Low,close=d.Close,name='Price'))
 for col in ['EMA5','EMA21','EMA50','EMA200','VWAP','BB_UPPER','BB_LOWER','SUPPORT','RESISTANCE','PIVOT','R1','S1']:
@@ -812,7 +965,7 @@ with tabs[3]:
         default_target=levels['Target 1'] if levels['Direction']==side and pd.notna(levels['Target 1']) else (price+2*(float(last.ATR) if pd.notna(last.ATR) else price*.01) if side=='BUY' else max(.01,price-2*(float(last.ATR) if pd.notna(last.ATR) else price*.01)))
         sl=st.number_input('Stop Loss',0.0,value=float(max(.01,default_sl)),step=.05);target=st.number_input('Target 1',0.0,value=float(max(.01,default_target)),step=.05)
     with c:
-        est=(price-entry)*qty if side=='BUY' else (entry-price)*qty;st.metric('Live P/L',f'{est:+,.2f}');st.metric('Paper Balance',f'Rs. {st.session_state.balance:,.2f}');st.metric('Realized P/L',f'Rs. {st.session_state.realized_pnl:+,.2f}')
+        est=(price-entry)*qty if side=='BUY' else (entry-price)*qty;st.metric('Live P/L',f'{est:+,.2f}');st.metric('Paper Balance',f'{st.session_state.balance:,.2f}');st.metric('Realized P/L',f'{st.session_state.realized_pnl:+,.2f}')
     if st.button('??| Open Paper Position',use_container_width=True):
         st.session_state.paper_trades.append({'Symbol':symbol,'Side':side,'Quantity':float(qty),'Entry':float(entry),'Stop Loss':float(sl),'Target':float(target),'Opened':datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'Status':'OPEN','Exit':np.nan,'Exit Time':'','Final P/L':np.nan});st.rerun()
     if st.session_state.paper_trades:
@@ -864,10 +1017,10 @@ with tabs[5]:
     oa=opening_analysis(symbol,d)
     if oa:
         p1,p2,p3,p4=st.columns(4)
-        p1.metric('Previous Close',f"Rs. {oa['prev_close']:,.2f}")
-        p2.metric('Possible Open Mid',f"Rs. {oa['estimated_mid']:,.2f}")
-        p3.metric('Possible Open Low',f"Rs. {oa['estimated_low']:,.2f}")
-        p4.metric('Possible Open High',f"Rs. {oa['estimated_high']:,.2f}")
+        p1.metric('Previous Close',f"{oa['prev_close']:,.2f}")
+        p2.metric('Possible Open Mid',f"{oa['estimated_mid']:,.2f}")
+        p3.metric('Possible Open Low',f"{oa['estimated_low']:,.2f}")
+        p4.metric('Possible Open High',f"{oa['estimated_high']:,.2f}")
         st.metric('Pre-Session Multifactor Bias',oa['bias'],f"Factor score {oa['factor_score']}/5")
         pre=preopen_snapshot()
         if pre:
@@ -911,7 +1064,7 @@ with tabs[9]:
     rs_entry=st.number_input('Sizing Entry Price',0.01,float(levels['Entry']),0.05)
     rs_sl=st.number_input('Sizing Stop Loss',0.01,float(levels['Stop Loss']) if pd.notna(levels['Stop Loss']) else max(0.01,price-price*0.01),0.05)
     qty_s,risk_cash=risk_position_size(rs_entry,rs_sl,st.session_state.balance,st.session_state.risk_per_trade,st.session_state.max_position_value)
-    r1,r2,r3=st.columns(3);r1.metric('Suggested Qty',qty_s);r2.metric('Max Risk Rs. ',f'{risk_cash:,.2f}');r3.metric('Risk %',f"{st.session_state.risk_per_trade:.2f}%")
+    r1,r2,r3=st.columns(3);r1.metric('Suggested Qty',qty_s);r2.metric('Max Risk',f'{risk_cash:,.2f}');r3.metric('Risk %',f"{st.session_state.risk_per_trade:.2f}%")
     st.caption('Position size is a rule-based risk calculation, not a guarantee or order instruction.')
 
 with tabs[10]:
