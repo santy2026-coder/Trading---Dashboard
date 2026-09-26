@@ -475,7 +475,7 @@ def backtest(symbol, period):
                     exit_price=target; exit_date=d.index[j]; outcome='WIN'; hit_bar=j; break
         ret=(exit_price-entry)/entry*100 if sig=='BUY' else (entry-exit_price)/entry*100
         if outcome=='TIME EXIT': outcome='WIN' if ret>0 else 'LOSS' if ret<0 else 'FLAT'
-        records.append({'Signal Date':d.index[i],'Entry Date':d.index[i+1],'Exit Date':exit_date,'Signal':sig,'Score':score,'Entry':entry,'Stop Loss':sl,'Target':target,'Exit':exit_price,'Return %':ret,'Outcome':outcome,'Win':outcome=='WIN'})
+        records.append({'Signal Date':d.index[i],'Entry Date':d.index[i+1],'Exit Date':exit_date,'Signal':sig,'Score':score,'Entry':entry,'Stop Loss':sl,'Target':target,'Exit':exit_price,'Return %':ret,'Outcome':outcome,'Win':outcome=='WIN','ADX':float(row.ADX) if pd.notna(row.ADX) else np.nan,'RSI':float(row.RSI) if pd.notna(row.RSI) else np.nan,'VWAP Gap ATR':abs(float(row.Close-row.VWAP))/max(float(row.ATR),1e-9) if pd.notna(row.VWAP) and pd.notna(row.ATR) else np.nan,'Trend':trend,'Pattern Bias':pb})
     bt=pd.DataFrame(records)
     if bt.empty:return bt,{}
     wins=int((bt['Outcome']=='WIN').sum()); losses=int((bt['Outcome']=='LOSS').sum()); flats=int((bt['Outcome']=='FLAT').sum()); total=len(bt)
@@ -483,6 +483,24 @@ def backtest(symbol, period):
     equity=bt['Return %'].cumsum(); dd=(equity.cummax()-equity);
     stats={'signals':total,'wins':wins,'losses':losses,'flats':flats,'win_rate':wins/total*100,'loss_rate':losses/total*100,'avg_return':float(bt['Return %'].mean()),'net_return_pct':float(bt['Return %'].sum()),'max_drawdown_pct':float(dd.max()),'buy_trades':len(buy),'sell_trades':len(sell),'buy_wins':int((buy.Outcome=='WIN').sum()),'sell_wins':int((sell.Outcome=='WIN').sum()),'buy_losses':int((buy.Outcome=='LOSS').sum()),'sell_losses':int((sell.Outcome=='LOSS').sum()),'buy_win_rate':float((buy.Outcome=='WIN').mean()*100) if len(buy) else np.nan,'sell_win_rate':float((sell.Outcome=='WIN').mean()*100) if len(sell) else np.nan}
     return bt,stats
+
+
+def backtest_diagnostics(bt):
+    if bt is None or bt.empty:
+        return pd.DataFrame(), 'No losing trades to diagnose.'
+    losses=bt[bt['Outcome']=='LOSS'].copy()
+    if losses.empty:
+        return pd.DataFrame(), 'No losing trades in this sample.'
+    buckets=[]
+    if 'ADX' in losses: buckets.append(('Weak trend ADX < 20', int((losses['ADX']<20).sum())))
+    if 'RSI' in losses: buckets.append(('RSI extreme (<30 or >70)', int(((losses['RSI']<30)|(losses['RSI']>70)).sum())))
+    if 'VWAP Gap ATR' in losses: buckets.append(('Close within 0.25 ATR of VWAP', int((losses['VWAP Gap ATR']<0.25).sum())))
+    if 'Score' in losses: buckets.append(('Borderline ensemble score (<=7)', int((losses['Score']<=7).sum())))
+    if 'Trend' in losses: buckets.append(('Trend was mixed/sideways', int(losses['Trend'].isin(['MIXED / TRANSITION','SIDEWAYS / RANGE']).sum())))
+    if 'Pattern Bias' in losses: buckets.append(('Candlestick bias conflicted/neutral', int((losses['Pattern Bias']<=0).sum())))
+    buckets.append(('Stop Loss Hit', len(losses)))
+    diag=pd.DataFrame(buckets,columns=['Diagnostic','Count']).sort_values('Count',ascending=False)
+    return diag, 'These are observable conditions present in losing trades, not proof that any single factor caused the loss. The ensemble gate is designed to filter several weaker setups.'
 
 
 @st.cache_data(ttl=60, show_spinner=False)
