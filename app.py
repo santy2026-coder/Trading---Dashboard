@@ -13,10 +13,27 @@ try:
 except Exception:
     st_autorefresh = None
 
+# ---------------- ANGEL ONE SMARTAPI (OPTIONAL) ----------------
+try:
+    from SmartApi import SmartConnect
+    import pyotp
+    ANGEL_SDK_AVAILABLE = True
+except Exception:
+    SmartConnect = None
+    pyotp = None
+    ANGEL_SDK_AVAILABLE = False
+
 st.set_page_config(page_title='Advanced Trading Dashboard', page_icon='[CHART]', layout='wide')
 
 # ---------------- STATE ----------------
-for k, v in {'logged_in':False,'paper_trades':[],'realized_pnl':0.0,'balance':100000.0,'risk_per_trade':1.0,'max_position_value':100000.0,'auto_exit':False,'last_data_status':'Unknown'}.items():
+for k, v in {
+    'logged_in':False,'paper_trades':[],'realized_pnl':0.0,'balance':100000.0,
+    'risk_per_trade':1.0,'max_position_value':100000.0,'auto_exit':False,
+    'last_data_status':'Unknown',
+    'angel_connected':False,'angel_client':None,'angel_profile':{},
+    'angel_feed_token':None,'angel_refresh_token':None,
+    'angel_selected_instrument':None,'angel_last_order':None
+}.items():
     if k not in st.session_state: st.session_state[k] = v
 if 'demo_password' not in st.session_state: st.session_state.demo_password = 'admin123'
 
@@ -64,6 +81,152 @@ def login_page():
 if not st.session_state.logged_in:
     login_page(); st.stop()
 
+
+# ---------------- ANGEL ONE HELPERS ----------------
+def angel_connect(api_key, client_code, pin, totp_value):
+    """Create an Angel One SmartAPI session. Credentials are kept only in Streamlit session state."""
+    if not ANGEL_SDK_AVAILABLE:
+        return False, "SmartAPI SDK is not installed. Run: pip install smartapi-python pyotp logzero websocket-client"
+    api_key = str(api_key or "").strip()
+    client_code = str(client_code or "").strip()
+    pin = str(pin or "").strip()
+    totp_value = str(totp_value or "").replace(" ", "").strip()
+    if not all([api_key, client_code, pin, totp_value]):
+        return False, "API key, client code, PIN and TOTP/QR secret are required."
+    try:
+        # Accept either a current 6-digit TOTP or the TOTP secret from Angel One.
+        if totp_value.isdigit() and len(totp_value) == 6:
+            otp = totp_value
+        else:
+            otp = pyotp.TOTP(totp_value).now()
+        client = SmartConnect(api_key=api_key)
+        session = client.generateSession(client_code, pin, otp)
+        if not isinstance(session, dict) or session.get("status") is False or not session.get("data"):
+            msg = session.get("message", "Angel One login failed.") if isinstance(session, dict) else "Angel One login failed."
+            return False, str(msg)
+        refresh_token = session["data"].get("refreshToken")
+        feed_token = client.getfeedToken()
+        profile = client.getProfile(refresh_token) if refresh_token else {}
+        st.session_state.angel_client = client
+        st.session_state.angel_connected = True
+        st.session_state.angel_refresh_token = refresh_token
+        st.session_state.angel_feed_token = feed_token
+        st.session_state.angel_profile = profile.get("data", profile) if isinstance(profile, dict) else {}
+        return True, "Angel One connected."
+    except Exception as exc:
+        st.session_state.angel_connected = False
+        st.session_state.angel_client = None
+        return False, f"Angel One connection failed: {exc}"
+
+def angel_disconnect():
+    client = st.session_state.get("angel_client")
+    profile = st.session_state.get("angel_profile") or {}
+    client_code = profile.get("clientcode") or profile.get("clientCode")
+    try:
+        if client is not None and client_code:
+            client.terminateSession(str(client_code))
+    except Exception:
+        pass
+    st.session_state.angel_connected = False
+    st.session_state.angel_client = None
+    st.session_state.angel_profile = {}
+    st.session_state.angel_feed_token = None
+    st.session_state.angel_refresh_token = None
+    st.session_state.angel_selected_instrument = None
+
+def angel_search(exchange, query):
+    client = st.session_state.get("angel_client")
+    if not st.session_state.get("angel_connected") or client is None:
+        return pd.DataFrame(), "Connect Angel One first."
+    try:
+        res = client.searchScrip(exchange, str(query).strip())
+        rows = res.get("data", []) if isinstance(res, dict) else []
+        if not rows:
+            return pd.DataFrame(), "No matching instrument found."
+        out = pd.DataFrame(rows)
+        keep = [c for c in ["exchange","tradingsymbol","symboltoken"] if c in out.columns]
+        return out[keep].drop_duplicates().head(100), "OK"
+    except Exception as exc:
+        return pd.DataFrame(), f"Symbol search failed: {exc}"
+
+def angel_ltp(instrument):
+    client = st.session_state.get("angel_client")
+    if client is None or not instrument:
+        return np.nan, {}
+    try:
+        exchange = str(instrument["exchange"])
+        tradingsymbol = str(instrument["tradingsymbol"])
+        symboltoken = str(instrument["symboltoken"])
+        res = client.ltpData(exchange, tradingsymbol, symboltoken)
+        data_obj = res.get("data", {}) if isinstance(res, dict) else {}
+        ltp = pd.to_numeric(data_obj.get("ltp"), errors="coerce")
+        return (float(ltp) if pd.notna(ltp) else np.nan), data_obj
+    except Exception:
+        return np.nan, {}
+
+def angel_place_manual_order(instrument, side, qty, order_type, product_type, limit_price=0.0):
+    """Place a user-confirmed manual order through Angel One SmartAPI."""
+    client = st.session_state.get("angel_client")
+    if client is None or not st.session_state.get("angel_connected"):
+        return False, "Angel One is not connected.", None
+    if not instrument:
+        return False, "Select an Angel One instrument first.", None
+    try:
+        qty = int(qty)
+        if qty <= 0:
+            return False, "Quantity must be at least 1.", None
+        order_type = str(order_type).upper()
+        price_value = 0 if order_type == "MARKET" else float(limit_price)
+        params = {
+            "variety": "NORMAL",
+            "tradingsymbol": str(instrument["tradingsymbol"]),
+            "symboltoken": str(instrument["symboltoken"]),
+            "transactiontype": str(side).upper(),
+            "exchange": str(instrument["exchange"]),
+            "ordertype": order_type,
+            "producttype": str(product_type).upper(),
+            "duration": "DAY",
+            "price": str(price_value),
+            "squareoff": "0",
+            "stoploss": "0",
+            "quantity": str(qty),
+        }
+        if hasattr(client, "placeOrderFullResponse"):
+            response = client.placeOrderFullResponse(params)
+            ok = isinstance(response, dict) and response.get("status", True) is not False
+            order_id = None
+            if isinstance(response, dict):
+                d = response.get("data") or {}
+                order_id = d.get("orderid") or d.get("orderId") if isinstance(d, dict) else None
+            return ok, ("Order submitted." if ok else str(response.get("message", "Order rejected."))), {"request": params, "response": response, "order_id": order_id}
+        order_id = client.placeOrder(params)
+        return bool(order_id), ("Order submitted." if order_id else "Order rejected."), {"request": params, "order_id": order_id}
+    except Exception as exc:
+        return False, f"Order placement failed: {exc}", None
+
+def angel_order_book():
+    client = st.session_state.get("angel_client")
+    if client is None:
+        return pd.DataFrame()
+    try:
+        res = client.orderBook()
+        rows = res.get("data", []) if isinstance(res, dict) else []
+        return pd.DataFrame(rows or [])
+    except Exception:
+        return pd.DataFrame()
+
+def angel_positions():
+    client = st.session_state.get("angel_client")
+    if client is None:
+        return pd.DataFrame()
+    try:
+        res = client.position()
+        rows = res.get("data", []) if isinstance(res, dict) else []
+        return pd.DataFrame(rows or [])
+    except Exception:
+        return pd.DataFrame()
+
+
 # ---------------- SYMBOLS ----------------
 NIFTY = {
 'RELIANCE':'RELIANCE.NS','TCS':'TCS.NS','INFY':'INFY.NS','HDFCBANK':'HDFCBANK.NS','ICICIBANK':'ICICIBANK.NS','SBIN':'SBIN.NS','ITC':'ITC.NS','BHARTIARTL':'BHARTIARTL.NS','TATAMOTORS':'TATAMOTORS.NS','LT':'LT.NS','AXISBANK':'AXISBANK.NS','KOTAKBANK':'KOTAKBANK.NS','SUNPHARMA':'SUNPHARMA.NS','TECHM':'TECHM.NS','WIPRO':'WIPRO.NS','ASIANPAINT':'ASIANPAINT.NS','HINDUNILVR':'HINDUNILVR.NS','MARUTI':'MARUTI.NS','ULTRACEMCO':'ULTRACEMCO.NS','TITAN':'TITAN.NS'}
@@ -71,7 +234,7 @@ CRYPTO = {'BTC / USD':'BTC-USD','ETH / USD':'ETH-USD','SOL / USD':'SOL-USD','BNB
 INDEXES = {'NIFTY 50':'^NSEI','BANK NIFTY':'^NSEBANK','SENSEX':'^BSESN','NIFTY IT':'^CNXIT','NIFTY AUTO':'^CNXAUTO','NIFTY PHARMA':'^CNXPHARMA'}
 TOP10_MONITOR = {'RELIANCE':'RELIANCE.NS','TCS':'TCS.NS','HDFCBANK':'HDFCBANK.NS','ICICIBANK':'ICICIBANK.NS','INFY':'INFY.NS','BHARTIARTL':'BHARTIARTL.NS','SBIN':'SBIN.NS','LT':'LT.NS','ITC':'ITC.NS','TATAMOTORS':'TATAMOTORS.NS'}
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def data(symbol, period, interval):
     try:
         d=yf.download(symbol,period=period,interval=interval,auto_adjust=False,progress=False,threads=False)
@@ -147,6 +310,102 @@ def indicators(d):
     d['SUPPORT']=l.rolling(20).min(); d['RESISTANCE']=h.rolling(20).max(); ph=h.shift(1); pl=l.shift(1); pcc=c.shift(1); pivot=(ph+pl+pcc)/3; d['PIVOT']=pivot; d['R1']=2*pivot-pl; d['S1']=2*pivot-h; d['R2']=pivot+(h-l); d['S2']=pivot-(h-l)
     diff=h.max()-l.min(); d.attrs['fib']={'0%':h.max(),'23.6%':h.max()-diff*.236,'38.2%':h.max()-diff*.382,'50%':h.max()-diff*.5,'61.8%':h.max()-diff*.618,'78.6%':h.max()-diff*.786,'100%':l.min()}
     return d
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fast_data(symbol, period, interval):
+    """Short-TTL intraday feed used only for fast entry/exit confirmation."""
+    try:
+        d=yf.download(symbol, period=period, interval=interval, auto_adjust=False,
+                      progress=False, threads=False)
+        if d is None or d.empty:
+            return pd.DataFrame()
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns=d.columns.get_level_values(0)
+        return d.dropna(subset=['Open','High','Low','Close']).copy()
+    except Exception:
+        return pd.DataFrame()
+
+def mtf_trend_label(d):
+    if d is None or d.empty:
+        return 'N/A'
+    try:
+        return trend_analysis(indicators(d))
+    except Exception:
+        return 'N/A'
+
+def fast_mtf_engine(symbol, current_price):
+    """1m entry timing + 5m confirmation + 15m direction."""
+    frames={}
+    for label,period,interval in [('1m','5d','1m'),('5m','1mo','5m'),('15m','1mo','15m')]:
+        raw=fast_data(symbol,period,interval)
+        frames[label]=indicators(raw) if not raw.empty else pd.DataFrame()
+
+    d1,d5,d15=frames['1m'],frames['5m'],frames['15m']
+    result={
+        'signal':'WAIT','score':0,'entry_score':0,'exit_buy':False,'exit_sell':False,
+        'trend_1m':mtf_trend_label(d1),'trend_5m':mtf_trend_label(d5),
+        'trend_15m':mtf_trend_label(d15),'reason':[],
+        'data_ok':not d1.empty
+    }
+    if d1.empty:
+        return result
+
+    r=d1.iloc[-1]
+    score=0
+    bullish=0
+    bearish=0
+    vol_ratio=0.0
+    if len(d1)>=21 and pd.notna(r.get('Volume')):
+        avg=float(d1['Volume'].tail(20).mean())
+        vol_ratio=float(r['Volume'])/avg if avg else 0.0
+
+    bullish_checks=[
+        (pd.notna(r.get('Close')) and pd.notna(r.get('EMA5')) and r.Close>r.EMA5,10,'Price > EMA5'),
+        (pd.notna(r.get('EMA5')) and pd.notna(r.get('EMA21')) and r.EMA5>r.EMA21,10,'EMA5 > EMA21'),
+        (pd.notna(r.get('MACD_HIST')) and r.MACD_HIST>0,10,'MACD momentum positive'),
+        (pd.notna(r.get('RSI')) and 52<=r.RSI<=72,10,'RSI bullish zone'),
+        (pd.notna(r.get('VWAP')) and r.Close>r.VWAP,10,'Price > VWAP'),
+        (vol_ratio>=1.2,10,'Volume expansion'),
+        (result['trend_5m'] in ('BULLISH TREND','STRONG UPTREND'),15,'5m trend aligned'),
+        (result['trend_15m'] in ('BULLISH TREND','STRONG UPTREND'),15,'15m trend aligned'),
+    ]
+    bearish_checks=[
+        (pd.notna(r.get('Close')) and pd.notna(r.get('EMA5')) and r.Close<r.EMA5,10,'Price < EMA5'),
+        (pd.notna(r.get('EMA5')) and pd.notna(r.get('EMA21')) and r.EMA5<r.EMA21,10,'EMA5 < EMA21'),
+        (pd.notna(r.get('MACD_HIST')) and r.MACD_HIST<0,10,'MACD momentum negative'),
+        (pd.notna(r.get('RSI')) and 28<=r.RSI<=48,10,'RSI bearish zone'),
+        (pd.notna(r.get('VWAP')) and r.Close<r.VWAP,10,'Price < VWAP'),
+        (vol_ratio>=1.2,10,'Volume expansion'),
+        (result['trend_5m'] in ('BEARISH TREND','STRONG DOWNTREND'),15,'5m trend aligned'),
+        (result['trend_15m'] in ('BEARISH TREND','STRONG DOWNTREND'),15,'15m trend aligned'),
+    ]
+    bull_score=sum(w for ok,w,_ in bullish_checks if ok)
+    bear_score=sum(w for ok,w,_ in bearish_checks if ok)
+    if bull_score>=70 and bull_score>bear_score:
+        result['signal']='BUY'; result['score']=bull_score
+        result['reason']=[label for ok,_,label in bullish_checks if ok]
+    elif bear_score>=70 and bear_score>bull_score:
+        result['signal']='SELL'; result['score']=bear_score
+        result['reason']=[label for ok,_,label in bearish_checks if ok]
+    else:
+        result['score']=max(bull_score,bear_score)
+        result['reason']=['MTF confirmation incomplete']
+
+    # Fast exit: momentum/trend deterioration, independent of slow news/macro calls.
+    result['exit_buy']=(
+        pd.notna(r.get('MACD_HIST')) and r.MACD_HIST<0 and
+        pd.notna(r.get('Close')) and pd.notna(r.get('EMA5')) and r.Close<r.EMA5 and
+        (pd.isna(r.get('VWAP')) or r.Close<r.VWAP)
+    )
+    result['exit_sell']=(
+        pd.notna(r.get('MACD_HIST')) and r.MACD_HIST>0 and
+        pd.notna(r.get('Close')) and pd.notna(r.get('EMA5')) and r.Close>r.EMA5 and
+        (pd.isna(r.get('VWAP')) or r.Close>r.VWAP)
+    )
+    result['volume_ratio']=vol_ratio
+    return result
+
 
 def candle_patterns(d):
     if len(d)<5:return []
@@ -385,8 +644,31 @@ def trade_levels(price, row, strength):
         be=entry
     else:
         entry=price; sl=np.nan; t1=np.nan; t2=np.nan; t3=np.nan; trailing=np.nan; be=np.nan; risk=np.nan
+    rr1=abs((t1-entry)/(entry-sl)) if direction in ('BUY','SELL') and entry!=sl else np.nan
     rr2=abs((t2-entry)/(entry-sl)) if direction in ('BUY','SELL') and entry!=sl else np.nan
-    return {'Direction':direction,'Entry':entry,'Stop Loss':sl,'Target 1':t1,'Target 2':t2,'Target 3':t3,'Trailing Stop':trailing,'Break-even Stop':be,'Risk':risk,'RR to T2':rr2,'Support':support,'Resistance':resistance,'Pivot':pivot}
+    rr3=abs((t3-entry)/(entry-sl)) if direction in ('BUY','SELL') and entry!=sl else np.nan
+    # Recommended RR: prefer 1:2 when the structure allows it; otherwise 1:1.5.
+    # 1:1 is displayed only as a lower-quality fallback, never as the preferred setup.
+    if direction in ('BUY','SELL'):
+        if pd.notna(rr3) and rr3 >= 2.0:
+            recommended_rr = 2.0
+            rr_label = '1:2'
+        elif pd.notna(rr2) and rr2 >= 1.5:
+            recommended_rr = 1.5
+            rr_label = '1:1.5'
+        elif pd.notna(rr1) and rr1 >= 1.0:
+            recommended_rr = 1.0
+            rr_label = '1:1 (LOW QUALITY)'
+        else:
+            recommended_rr = np.nan
+            rr_label = 'NO TRADE'
+    else:
+        recommended_rr = np.nan
+        rr_label = 'NO TRADE'
+    return {'Direction':direction,'Entry':entry,'Stop Loss':sl,'Target 1':t1,'Target 2':t2,'Target 3':t3,'Trailing Stop':trailing,'Break-even Stop':be,'Risk':risk,
+            'RR to T1': rr1,'RR to T2':rr2,'RR to T3':rr3,
+            'Recommended RR':recommended_rr,'Recommended RR Label':rr_label,
+            'Support':support,'Resistance':resistance,'Pivot':pivot}
 
 @st.cache_data(ttl=60, show_spinner=False)
 def option_suggestions(symbol, underlying_price):
@@ -698,7 +980,7 @@ st.session_state.risk_per_trade = st.sidebar.number_input('Risk / Trade %', 0.1,
 st.session_state.max_position_value = st.sidebar.number_input('Max Position Value', 1000.0, 10000000.0, float(st.session_state.max_position_value), 1000.0)
 st.session_state.auto_exit = st.sidebar.toggle('Paper Auto SL/Target/Trailing', value=st.session_state.auto_exit)
 auto_refresh = st.sidebar.toggle('[AUTO] Auto Refresh', value=False, help='Refresh live data automatically')
-refresh_seconds = st.sidebar.selectbox('Refresh Interval', [15,30,60,120,300], index=2, format_func=lambda x:f'{x} seconds', disabled=not auto_refresh)
+refresh_seconds = st.sidebar.selectbox('Refresh Interval', [10,15,30,60,120,300], index=1, format_func=lambda x:f'{x} seconds', disabled=not auto_refresh)
 if auto_refresh and st_autorefresh is not None:
     st_autorefresh(interval=refresh_seconds*1000, key='live_market_autorefresh')
 elif auto_refresh and st_autorefresh is None:
@@ -732,6 +1014,7 @@ d=data(symbol,fetch_period,selected_interval)
 if d.empty:st.error('Data unavailable. Try another symbol or Daily timeframe.');st.stop()
 d=indicators(d); last=d.iloc[-1]; prev=d.iloc[-2] if len(d)>1 else last
 price=float(last.Close); change=price-float(prev.Close); pct=change/float(prev.Close)*100 if prev.Close else 0
+fast_mtf = fast_mtf_engine(symbol, price)
 if asset=='Crypto':
     cprice,cpct=crypto_24h_quote(symbol)
     if pd.notna(cprice):
@@ -769,6 +1052,17 @@ for key in ('USD/INR','Crude Oil'):
         macro_score += (-1 if key=='USD/INR' and ch>0.2 else 1 if key=='USD/INR' and ch<-0.2 else 0)
         macro_score += (-1 if key=='Crude Oil' and ch>0.8 else 1 if key=='Crude Oil' and ch<-0.8 else 0)
 sig,mf_score,strength,live_confirmation=enhanced_signal(sig, mf_score, pattern_bias, news_info, macro_score, institutional_score, basket_score, pcr_oi)
+
+# Fast MTF trigger: allows earlier entries without making PCR/news/macro the primary trigger.
+if fast_mtf['signal']=='BUY' and fast_mtf['score']>=75 and fast_mtf['trend_15m'] in ('BULLISH TREND','STRONG UPTREND') and sig in ('WAIT','BUY'):
+    sig='BUY'
+    mf_score=max(float(mf_score), min(10.0, 6.5 + (fast_mtf['score']-70)/20))
+    strength='STRONG BUY' if fast_mtf['score']>=85 else 'BUY BIAS'
+elif fast_mtf['signal']=='SELL' and fast_mtf['score']>=75 and fast_mtf['trend_15m'] in ('BEARISH TREND','STRONG DOWNTREND') and sig in ('WAIT','SELL'):
+    sig='SELL'
+    mf_score=min(float(mf_score), max(0.0, 3.5 - (fast_mtf['score']-70)/20))
+    strength='STRONG SELL' if fast_mtf['score']>=85 else 'SELL BIAS'
+
 score=mf_score
 levels=trade_levels(price,last,strength)
 option_suggest, option_suggest_status = option_suggestions(symbol, price)
@@ -815,18 +1109,57 @@ if summary_stats:
 else:
     st.warning('Backtest needs at least about 80 daily candles. Select a longer chart/data period or a symbol with sufficient history.')
 
-st.subheader('[TRADE] Trade Setup - Entry / Targets / Stop Loss')
+st.subheader('[TRADE] Trade Setup - Entry / Targets / Stop Loss / RR')
 if levels['Direction'] != 'WAIT':
-    e1,e2,e3,e4,e5,e6=st.columns(6)
+    e1,e2,e3,e4,e5,e6,e7=st.columns(7)
     e1.metric('Suggested Entry',fmt_price(levels['Entry']))
     e2.metric('Initial Stop Loss',fmt_price(levels['Stop Loss']))
     e3.metric('Target 1',fmt_price(levels['Target 1']))
     e4.metric('Target 2',fmt_price(levels['Target 2']))
     e5.metric('Target 3',fmt_price(levels['Target 3']))
-    e6.metric('Trailing Stop',fmt_price(levels['Trailing Stop']))
-    st.caption(f"{levels['Direction']} setup | Break-even stop after T1: {fmt_price(levels['Break-even Stop'])} | Approx. Risk/Reward to T2: 1:{fmt_num(levels['RR to T2'])}")
+    e6.metric('Risk / Unit',fmt_price(levels['Risk']))
+    e7.metric('Recommended RR',levels.get('Recommended RR Label','NO TRADE'))
+    rr_ok=pd.notna(levels.get('Recommended RR')) and float(levels.get('Recommended RR'))>=1.5
+    rr_t1 = levels.get('RR to T1', np.nan)
+    rr_t2 = levels.get('RR to T2', np.nan)
+    rr_t3 = levels.get('RR to T3', np.nan)
+    st.write(f"**RR Map:** T1 = 1:{fmt_num(rr_t1)} | T2 = 1:{fmt_num(rr_t2)} | T3 = 1:{fmt_num(rr_t3)} | **Recommended = {levels.get('Recommended RR Label','NO TRADE')}**")
+    st.caption(f"{levels['Direction']} setup | RR quality: {'PASS' if rr_ok else 'FAIL / LOW QUALITY'} | Break-even after T1: {fmt_price(levels['Break-even Stop'])} | Trailing Stop: {fmt_price(levels['Trailing Stop'])}")
 else:
-    st.info('No clear BUY/SELL signal. Entry, targets and stop-loss are not activated until a directional signal appears.')
+    st.info('No clear BUY/SELL signal. Entry, targets, stop-loss and RR are not activated until a directional signal appears.')
+
+st.subheader('[QUALITY] Recommended RR & Accuracy Filter')
+if levels['Direction'] != 'WAIT':
+    recommended_rr = levels.get('Recommended RR', np.nan)
+    rr_label = levels.get('Recommended RR Label', 'NO TRADE')
+    quality_cols = st.columns(4)
+    quality_cols[0].metric('Recommended RR', rr_label)
+    quality_cols[1].metric('RR to T1', f"1:{fmt_num(levels.get('RR to T1', np.nan))}")
+    quality_cols[2].metric('RR to T2', f"1:{fmt_num(levels.get('RR to T2', np.nan))}")
+    quality_cols[3].metric('RR to T3', f"1:{fmt_num(levels.get('RR to T3', np.nan))}")
+    if rr_label == '1:2':
+        st.success('HIGHER-QUALITY RR setup: 1:2 or better structure available.')
+    elif rr_label == '1:1.5':
+        st.info('ACCEPTABLE RR setup: 1:1.5. Prefer confirmation before entry.')
+    elif rr_label == '1:1 (LOW QUALITY)':
+        st.warning('LOW RR setup: 1:1. The dashboard should avoid treating this as a high-quality entry.')
+    else:
+        st.error('NO TRADE: available structure does not provide the minimum 1:1 RR.')
+else:
+    st.info('No directional setup, so no RR recommendation is active.')
+
+st.subheader('[MTF] Fast Entry / Exit Confirmation')
+f1,f2,f3,f4,f5=st.columns(5)
+f1.metric('Fast Signal',fast_mtf['signal'],f"{fast_mtf['score']}/100")
+f2.metric('1m Trend',fast_mtf['trend_1m'])
+f3.metric('5m Trend',fast_mtf['trend_5m'])
+f4.metric('15m Trend',fast_mtf['trend_15m'])
+f5.metric('Fast Volume',f"{fast_mtf.get('volume_ratio',0):.2f}x")
+st.caption("Fast engine: 1m entry timing + 5m confirmation + 15m direction. PCR/news/macro remain confirmation layers, not the primary trigger.")
+if fast_mtf['signal']!='WAIT':
+    st.write("**Fast confirmation:** " + " | ".join(fast_mtf['reason'][:8]))
+if fast_mtf['exit_buy'] or fast_mtf['exit_sell']:
+    st.warning("Fast exit condition detected: momentum/EMA/VWAP deterioration. Review the open position before holding further.")
 
 st.subheader('[ANALYSIS]  Live Critical Analysis')
 ca,cb,cc,cd,ce=st.columns(5)
@@ -886,7 +1219,7 @@ q3.metric('Volume',vol_label,f'{vol_ratio:.2f}x')
 q4.metric('PCR',f'{pcr_oi:.2f}' if pd.notna(pcr_oi) else 'N/A')
 q5.metric('Confirmation','YES' if live_confirmation else 'WAIT')
 
-tabs=st.tabs(['Indicators','Patterns','Backtest','Paper Trading','Market','Pre-Open','Options','News','Data','FII/DII & Risk','Settings'])
+tabs=st.tabs(['Indicators','Patterns','Backtest','Paper Trading','Market','Pre-Open','Options','News','Data','FII/DII & Risk','Settings','Angel One'])
 with tabs[0]:
     c1,c2,c3=st.columns(3);c1.metric('EMA 5',f'{last.EMA5:.2f}');c1.metric('EMA 21',f'{last.EMA21:.2f}');c1.metric('EMA 50',f'{last.EMA50:.2f}');c2.metric('EMA 200',f'{last.EMA200:.2f}');c2.metric('VWAP',f'{last.VWAP:.2f}');c3.metric('ATR',f'{last.ATR:.2f}')
     a,b=st.columns(2)
@@ -929,7 +1262,15 @@ with tabs[2]:
         x2.metric('SELL W / L',f"{stats['sell_wins']} / {stats['sell_losses']}")
         x3.metric('BUY Hit Rate',f"{stats['buy_win_rate']:.2f}%" if pd.notna(stats['buy_win_rate']) else 'N/A')
         x4.metric('SELL Hit Rate',f"{stats['sell_win_rate']:.2f}%" if pd.notna(stats['sell_win_rate']) else 'N/A')
-        st.dataframe(bt.tail(300),use_container_width=True,hide_index=True)
+        bt_view=bt.copy()
+        bt_view['Cumulative Return %']=pd.to_numeric(bt_view['Return %'],errors='coerce').fillna(0).cumsum()
+        eq=go.Figure()
+        eq.add_trace(go.Scatter(x=bt_view['Exit Date'],y=bt_view['Cumulative Return %'],name='Cumulative Return %',mode='lines'))
+        eq.update_layout(height=300,template='plotly_dark',title='Backtest Equity Curve (simple cumulative %)',xaxis_title='Exit Date',yaxis_title='Cumulative Return %')
+        st.plotly_chart(eq,use_container_width=True)
+        st.dataframe(bt_view.tail(300),use_container_width=True,hide_index=True)
+        st.download_button('Download Backtest CSV',bt_view.to_csv(index=False).encode('utf-8'),file_name=f'backtest_{str(name).replace(" ","_")}_{bt_choice.replace(" ","_")}.csv',mime='text/csv',use_container_width=True)
+
     else:
         st.warning('Not enough historical data for this backtest period.')
     st.subheader('[CONFIDENCE] Current Setup')
@@ -1054,7 +1395,127 @@ with tabs[10]:
         st.cache_data.clear(); st.success('Cache cleared. Refresh the page to reload all feeds.')
     st.warning('Before real trading, replace demo authentication with secure hashed credentials/session management and connect a broker API with explicit order confirmation.')
 
+
+with tabs[11]:
+    st.subheader('[ANGEL ONE] Live Market + Manual Trading')
+    st.caption('Live execution is manual only. The app will not auto-place an order from a signal.')
+
+    if not ANGEL_SDK_AVAILABLE:
+        st.error('Angel One SDK is not installed in this environment.')
+        st.code('pip install smartapi-python pyotp logzero websocket-client', language='bash')
+    else:
+        if not st.session_state.get('angel_connected'):
+            st.info('Enter credentials for this Streamlit session. Do not hard-code API keys, PINs or TOTP secrets in the Python file.')
+            with st.form('angel_login_form'):
+                ac1,ac2=st.columns(2)
+                with ac1:
+                    angel_api_key=st.text_input('Angel One API Key',value=os.getenv('ANGEL_API_KEY',''),type='password')
+                    angel_client_code=st.text_input('Client Code',value=os.getenv('ANGEL_CLIENT_CODE',''))
+                with ac2:
+                    angel_pin=st.text_input('PIN',value=os.getenv('ANGEL_PIN',''),type='password')
+                    angel_totp=st.text_input('Current 6-digit TOTP OR TOTP secret',value=os.getenv('ANGEL_TOTP_SECRET',''),type='password')
+                connect_clicked=st.form_submit_button('Connect Angel One',use_container_width=True)
+            if connect_clicked:
+                ok,msg=angel_connect(angel_api_key,angel_client_code,angel_pin,angel_totp)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+        else:
+            topa,topb,topc=st.columns([2,1,1])
+            profile=st.session_state.get('angel_profile') or {}
+            topa.success(f"Connected: {profile.get('name') or profile.get('clientcode') or profile.get('clientCode') or 'Angel One account'}")
+            if topb.button('Disconnect Angel One',use_container_width=True):
+                angel_disconnect(); st.rerun()
+            if topc.button('Refresh Broker Data',use_container_width=True):
+                st.rerun()
+
+            st.markdown('#### 1) Select live instrument')
+            default_search = str(name).split('/')[0].strip()
+            exchange = st.selectbox('Angel Exchange',['NSE','BSE','NFO','BFO','MCX'],index=0,key='angel_exchange')
+            search_query = st.text_input('Search Angel One symbol',value=default_search,key='angel_search_query')
+            if st.button('Search Instrument',use_container_width=True):
+                found,msg=angel_search(exchange,search_query)
+                st.session_state.angel_search_results=found
+                if found.empty: st.warning(msg)
+
+            found = st.session_state.get('angel_search_results', pd.DataFrame())
+            if isinstance(found,pd.DataFrame) and not found.empty:
+                labels=[f"{r['exchange']} | {r['tradingsymbol']} | token {r['symboltoken']}" for _,r in found.iterrows()]
+                selected_label=st.selectbox('Instrument',labels,key='angel_instrument_label')
+                selected_idx=labels.index(selected_label)
+                r=found.iloc[selected_idx]
+                st.session_state.angel_selected_instrument={'exchange':str(r['exchange']),'tradingsymbol':str(r['tradingsymbol']),'symboltoken':str(r['symboltoken'])}
+
+            instrument=st.session_state.get('angel_selected_instrument')
+            if instrument:
+                ltp,ltp_info=angel_ltp(instrument)
+                l1,l2,l3,l4=st.columns(4)
+                l1.metric('Angel LTP',fmt_price(ltp))
+                l2.metric('Instrument',instrument['tradingsymbol'])
+                l3.metric('Exchange',instrument['exchange'])
+                l4.metric('Signal',sig)
+                if pd.notna(ltp):
+                    st.caption(f"Angel One live LTP: {fmt_price(ltp)} | Dashboard/Yahoo reference: {fmt_price(price)}")
+                with st.expander('Live quote details'):
+                    st.json(ltp_info if ltp_info else {'status':'No quote details returned'})
+
+                st.markdown('#### 2) Manual order ticket')
+                mode=st.radio('Trading Mode',['PAPER ONLY','LIVE MANUAL'],horizontal=True,key='angel_trade_mode')
+                oc1,oc2,oc3=st.columns(3)
+                with oc1:
+                    broker_side=st.selectbox('Order Side',['BUY','SELL'],key='angel_side')
+                    broker_qty=st.number_input('Quantity',min_value=1,value=1,step=1,key='angel_qty')
+                with oc2:
+                    broker_order_type=st.selectbox('Order Type',['MARKET','LIMIT'],key='angel_order_type')
+                    broker_product=st.selectbox('Product',['INTRADAY','DELIVERY'],key='angel_product')
+                with oc3:
+                    default_limit=float(ltp) if pd.notna(ltp) else float(price)
+                    broker_limit=st.number_input('Limit Price',min_value=0.0,value=default_limit,step=0.05,key='angel_limit',disabled=(broker_order_type=='MARKET'))
+                    st.metric('Recommended RR',levels.get('Recommended RR Label','NO TRADE'))
+
+                if mode=='PAPER ONLY':
+                    st.info('PAPER ONLY mode never sends an order to Angel One. Use the Paper Trading tab to record simulated positions.')
+                else:
+                    st.warning('LIVE MANUAL sends a real broker order only after you explicitly confirm it. Use only on an account you are legally authorized to operate.')
+                    live_confirm=st.checkbox(
+                        f"I confirm: send a REAL {broker_side} order for {int(broker_qty)} x {instrument['tradingsymbol']}.",
+                        key='angel_live_confirm'
+                    )
+                    if st.button('Send Manual Live Order',type='primary',use_container_width=True,disabled=not live_confirm):
+                        ok,msg,details=angel_place_manual_order(
+                            instrument,broker_side,broker_qty,broker_order_type,broker_product,broker_limit
+                        )
+                        st.session_state.angel_last_order=details
+                        if ok: st.success(msg)
+                        else: st.error(msg)
+
+                if st.session_state.get('angel_last_order'):
+                    with st.expander('Last manual order response'):
+                        st.json(st.session_state.angel_last_order)
+
+                st.markdown('#### 3) Broker positions & order book')
+                pcol,ocol=st.columns(2)
+                with pcol:
+                    st.write('**Positions**')
+                    posdf=angel_positions()
+                    if not posdf.empty: st.dataframe(posdf,use_container_width=True,hide_index=True)
+                    else: st.info('No position data returned.')
+                with ocol:
+                    st.write('**Order Book**')
+                    obdf=angel_order_book()
+                    if not obdf.empty: st.dataframe(obdf,use_container_width=True,hide_index=True)
+                    else: st.info('No order-book data returned.')
+            else:
+                st.info('Search and select an Angel One instrument to load live LTP and the manual order ticket.')
+
+    st.markdown('#### Backtest status')
+    st.write('The Backtest tab shows total trades, wins/losses, win rate, drawdown, BUY/SELL hit rate, equity curve, full trade table and CSV download.')
+    st.caption('Backtests are historical simulations and do not guarantee future results. Validate with paper trading before considering live use.')
+
+
 st.divider();st.subheader('[BROKER] Broker Integration')
 a,b,c,e=st.columns(4);a.metric('Angel One','API Ready');b.metric('Upstox','API Ready');c.metric('Delta Exchange','API Ready');e.metric('Sahi','API Ready')
-st.caption('Paper trading is functional. Real broker order execution requires your authorized API credentials and the broker current official API/SDK contract; this app does not place real orders.')
+st.caption('Paper trading is functional. Angel One manual live-order integration is available in its own tab when the official SmartAPI SDK and authorized credentials are configured. Auto-ordering from signals remains disabled.')
 st.info('Market data can be delayed, incomplete, or unavailable. Signals are informational and are not guaranteed investment advice.')
