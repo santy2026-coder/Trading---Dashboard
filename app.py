@@ -1,51 +1,44 @@
 def update_open_paper_positions(price):
-    """Refresh open paper-trading positions and return toast messages."""
-    if "paper_positions" not in st.session_state:
-        st.session_state.paper_positions = []
+    """Return paper-position event messages without crashing if the app is not ready."""
+    try:
+        current_price = float(price)
+    except (TypeError, ValueError, NameError):
+        return []
 
-    positions = st.session_state.get("paper_positions", [])
+    try:
+        positions = st.session_state.get("paper_positions", [])
+    except Exception:
+        positions = []
+
     if not positions:
         return []
 
     events = []
-    try:
-        current_price = float(price)
-    except (TypeError, ValueError):
-        return []
-
     for pos in positions:
         try:
-            symbol = pos.get("symbol", "POSITION")
+            symbol_name = pos.get("symbol", "POSITION")
             side = str(pos.get("side", "BUY")).upper()
             entry = float(pos.get("entry", 0.0) or 0.0)
             qty = float(pos.get("qty", 0.0) or 0.0)
-
             if qty == 0:
                 continue
-
-            if side == "BUY":
-                pnl = (current_price - entry) * qty
-            else:
-                pnl = (entry - current_price) * qty
-
+            pnl = (current_price - entry) * qty if side == "BUY" else (entry - current_price) * qty
             pos["last_price"] = current_price
             pos["pnl"] = pnl
-            pos["pnl_pct"] = (pnl / (abs(entry * qty) if abs(entry * qty) else 1.0)) * 100.0
-            events.append(f"{symbol}: {side} P/L = ₹{pnl:,.2f}")
+            events.append(f"{symbol_name}: {side} P/L = ₹{pnl:,.2f}")
         except Exception:
             continue
-
     return events
 
 
-# Safely update paper positions only if price is available
-auto_events = []
 try:
-    if 'price' in locals() and price is not None:
-        auto_events = update_open_paper_positions(price)
-except Exception:
-    auto_events = []
+    _price = float(price)
+except NameError:
+    _price = 0.0
+except (TypeError, ValueError):
+    _price = 0.0
 
+auto_events = update_open_paper_positions(_price)
 if auto_events:
     for ev in auto_events:
         st.toast(ev)
@@ -57,7 +50,7 @@ pattern_bias, current_patterns = candle_pattern_bias(d)
 if improved_entry_signal is not None:
     # Use improved signal with volume + breakout + momentum confirmation
     sig, score, signal_reason = improved_entry_signal(last, d)
-
+    
     # Map improved signal to strength labels
     if sig == 'BUY':
         strength = 'STRONG BUY' if score >= 5 else 'BUY BIAS'
@@ -65,7 +58,7 @@ if improved_entry_signal is not None:
         strength = 'STRONG SELL' if score >= 5 else 'SELL BIAS'
     else:
         strength = 'NO SIGNAL'
-
+    
     mf_score = float(score)
     vol_ratio = 1.0
     vol_label = 'UPGRADED ENGINE'
