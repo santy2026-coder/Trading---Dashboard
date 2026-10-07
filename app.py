@@ -1,6 +1,12 @@
-auto_events=update_open_paper_positions(price)
+if callable(globals().get('update_open_paper_positions')):
+    auto_events = update_open_paper_positions(price)
+else:
+    auto_events = []
+
 if auto_events:
-    for ev in auto_events: st.toast(ev)
+    for ev in auto_events:
+        st.toast(ev)
+
 pcr_oi, pcr_summary, pcr_status = option_pcr(symbol)
 pattern_bias, current_patterns = candle_pattern_bias(d)
 
@@ -8,7 +14,7 @@ pattern_bias, current_patterns = candle_pattern_bias(d)
 if improved_entry_signal is not None:
     # Use improved signal with volume + breakout + momentum confirmation
     sig, score, signal_reason = improved_entry_signal(last, d)
-    
+
     # Map improved signal to strength labels
     if sig == 'BUY':
         strength = 'STRONG BUY' if score >= 5 else 'BUY BIAS'
@@ -16,7 +22,7 @@ if improved_entry_signal is not None:
         strength = 'STRONG SELL' if score >= 5 else 'SELL BIAS'
     else:
         strength = 'NO SIGNAL'
-    
+
     mf_score = float(score)
     vol_ratio = 1.0
     vol_label = 'UPGRADED ENGINE'
