@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import os
-from urllib.parse import quote as urlquote
+from urllib.parse import quote as url_quote
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
@@ -66,11 +66,10 @@ if not st.session_state.logged_in:
 
 # ---------------- SYMBOLS ----------------
 NIFTY = {
-    'RELIANCE':'RELIANCE.NS','TCS':'TCS.NS','INFY':'INFY.NS','HDFCBANK':'HDFCBANK.NS','ICICIBANK':'ICICIBANK.NS','SBIN':'SBIN.NS','ITC':'ITC.NS','BHARTIARTL':'BHARTIARTL.NS','TATAMOTORS':'TATAMOTORS.NS','LT':'LT.NS','SUNPHARMA':'SUNPHARMA.NS','TECHM':'TECHM.NS','WIPRO':'WIPRO.NS','NTPC':'NTPC.NS','ASIANPAINT':'ASIANPAINT.NS','HINDUNILVR':'HINDUNILVR.NS','KOTAKBANK':'KOTAKBANK.NS','AXISBANK':'AXISBANK.NS','POWERGRID':'POWERGRID.NS','MARUTI':'MARUTI.NS'
-}
+'RELIANCE':'RELIANCE.NS','TCS':'TCS.NS','INFY':'INFY.NS','HDFCBANK':'HDFCBANK.NS','ICICIBANK':'ICICIBANK.NS','SBIN':'SBIN.NS','ITC':'ITC.NS','BHARTIARTL':'BHARTIARTL.NS','TATAMOTORS':'TATAMOTORS.NS','LT':'LT.NS','AXISBANK':'AXISBANK.NS','KOTAKBANK':'KOTAKBANK.NS','SUNPHARMA':'SUNPHARMA.NS','TECHM':'TECHM.NS','WIPRO':'WIPRO.NS','ASIANPAINT':'ASIANPAINT.NS','HINDUNILVR':'HINDUNILVR.NS','MARUTI':'MARUTI.NS','ULTRACEMCO':'ULTRACEMCO.NS','TITAN':'TITAN.NS'}
 CRYPTO = {'BTC / USD':'BTC-USD','ETH / USD':'ETH-USD','SOL / USD':'SOL-USD','BNB / USD':'BNB-USD','XRP / USD':'XRP-USD','DOGE / USD':'DOGE-USD','ADA / USD':'ADA-USD','AVAX / USD':'AVAX-USD'}
 INDEXES = {'NIFTY 50':'^NSEI','BANK NIFTY':'^NSEBANK','SENSEX':'^BSESN','NIFTY IT':'^CNXIT','NIFTY AUTO':'^CNXAUTO','NIFTY PHARMA':'^CNXPHARMA'}
-TOP10_MONITOR = {'RELIANCE':'RELIANCE.NS','TCS':'TCS.NS','HDFCBANK':'HDFCBANK.NS','ICICIBANK':'ICICIBANK.NS','INFY':'INFY.NS','BHARTIARTL':'BHARTIARTL.NS','SBIN':'SBIN.NS','LT':'LT.NS','ITC':'ITC.NS','SUNPHARMA':'SUNPHARMA.NS'}
+TOP10_MONITOR = {'RELIANCE':'RELIANCE.NS','TCS':'TCS.NS','HDFCBANK':'HDFCBANK.NS','ICICIBANK':'ICICIBANK.NS','INFY':'INFY.NS','BHARTIARTL':'BHARTIARTL.NS','SBIN':'SBIN.NS','LT':'LT.NS','ITC':'ITC.NS','TATAMOTORS':'TATAMOTORS.NS'}
 
 @st.cache_data(ttl=30, show_spinner=False)
 def data(symbol, period, interval):
@@ -116,14 +115,21 @@ def top10_performance():
     return pd.DataFrame(rows)
 
 def macro_news_queries():
-    return ['India government support sector announcement infrastructure defence semiconductor renewable energy','India RBI government policy market announcement','India major company earnings or corporate announcements','India major company earnings or announcements']
+    return ['India government support sector announcement infrastructure defence semiconductor renewable energy','India RBI government policy market announcement','India major company earnings or revenue growth and investment plan','India market volatility geopolitical risk and crude oil outlook']
+
+# --- Market quote helper (kept distinct from URL-encoding helper to avoid collisions) ---
+@st.cache_data(ttl=60,show_spinner=False)
+def quote(sym):
+    d=data(sym,'5d','1d')
+    if d.empty:return np.nan,np.nan
+    q=float(d.Close.iloc[-1]); p=float(d.Close.iloc[-2]) if len(d)>1 else q; return q,(q-p)/p*100 if p else 0
 
 
 def indicators(d):
     d=d.copy(); c=d.Close.astype(float); h=d.High.astype(float); l=d.Low.astype(float); v=d.Volume.fillna(0).astype(float)
     for n in (5,21,50,200):
         d[f'EMA{n}']=c.ewm(span=n,adjust=False).mean(); d[f'SMA{n}']=c.rolling(n).mean()
-    delta=c.diff(); gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean(); rs=gain/loss.replace(0,np.nan); d['RSI']=100-100/(1+rs)
+    delta=c.diff(); gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean(); rs=gain/loss.replace(0,np.nan); d['RSI']=100-(100/(1+rs))
     e12=c.ewm(span=12,adjust=False).mean(); e26=c.ewm(span=26,adjust=False).mean(); d['MACD']=e12-e26; d['MACD_SIGNAL']=d.MACD.ewm(span=9,adjust=False).mean(); d['MACD_HIST']=d.MACD-d.MACD_SIGNAL
     pc=c.shift(1); tr=pd.concat([h-l,(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1); d['ATR']=tr.rolling(14).mean()
     tp=(h+l+c)/3
@@ -144,8 +150,7 @@ def indicators(d):
 
 def candle_patterns(d):
     if len(d)<5:return []
-    o,h,l,c=d.Open,d.High,d.Low,d.Close; body=(c-o).abs(); rng=(h-l).replace(0,np.nan); upper=h-pd.concat([o,c],axis=1).max(axis=1); lower=pd.concat([o,c],axis=1).min(axis=1)-l; i,p,p2=-1,-2,-3
-    out=[]
+    o,h,l,c=d.Open,d.High,d.Low,d.Close; body=(c-o).abs(); rng=(h-l).replace(0,np.nan); upper=h-pd.concat([o,c],axis=1).max(axis=1); lower=pd.concat([o,c],axis=1).min(axis=1)-l; i,p,p2=-1,-2,-3; out=[]
     if body.iloc[i]<=rng.iloc[i]*.1:out.append('Doji')
     if lower.iloc[i]>=body.iloc[i]*2 and upper.iloc[i]<=body.iloc[i]*.5:out.append('Hammer')
     if upper.iloc[i]>=body.iloc[i]*2 and lower.iloc[i]<=body.iloc[i]*.5:out.append('Shooting Star')
@@ -153,8 +158,8 @@ def candle_patterns(d):
     if c.iloc[i]>o.iloc[i] and c.iloc[p]<o.iloc[p] and o.iloc[i]<=c.iloc[p] and c.iloc[i]>=o.iloc[p]:out.append('Bullish Engulfing')
     if c.iloc[i]<o.iloc[i] and c.iloc[p]>o.iloc[p] and o.iloc[i]>=c.iloc[p] and c.iloc[i]<=o.iloc[p]:out.append('Bearish Engulfing')
     mid=(o.iloc[p]+c.iloc[p])/2
-    if c.iloc[p]<o.iloc[p] and c.iloc[i]>o.iloc[i] and o.iloc[i]<c.iloc[p] and c.iloc[i]>mid:out.append('Piercing Pattern')
-    if c.iloc[p]>o.iloc[p] and c.iloc[i]<o.iloc[i] and o.iloc[i]>c.iloc[p] and c.iloc[i]<mid:out.append('Dark Cloud Cover')
+    if c.iloc[p]<o.iloc[p] and c.iloc[i]>o.iloc[i] and o.iloc[i]<c.iloc[p] and o.iloc[i]>mid:out.append('Piercing Pattern')
+    if c.iloc[p]>o.iloc[p] and c.iloc[i]<o.iloc[i] and o.iloc[i]>c.iloc[p] and o.iloc[i]<mid:out.append('Dark Cloud Cover')
     if c.iloc[p2]<o.iloc[p2] and body.iloc[p]<body.iloc[p2]*.5 and c.iloc[i]>o.iloc[i] and c.iloc[i]>(o.iloc[p2]+c.iloc[p2])/2:out.append('Morning Star')
     if c.iloc[p2]>o.iloc[p2] and body.iloc[p]<body.iloc[p2]*.5 and c.iloc[i]<o.iloc[i] and c.iloc[i]<(o.iloc[p2]+c.iloc[p2])/2:out.append('Evening Star')
     if all(c.iloc[x]>o.iloc[x] for x in (i,p,p2)):out.append('Three White Soldiers')
@@ -244,27 +249,14 @@ def confidence_score(row, d, pcr, news_info, pattern_bias, trend, historical_hit
     confidence=int(round(max(0,min(95,confidence))))
     return confidence,reasons
 
-@st.cache_data(ttl=60,show_spinner=False)
-def quote(sym):
-    d=data(sym,'5d','1d')
-    if d.empty:return np.nan,np.nan
-    q=float(d.Close.iloc[-1]); p=float(d.Close.iloc[-2]) if len(d)>1 else q; return q,(q-p)/p*100 if p else 0
 
-@st.cache_data(ttl=120,show_spinner=False)
-def news():
-    try:
-        u='https://query1.finance.yahoo.com/v1/finance/search?q='+urlquote('India stock market geopolitical crude oil')
-        r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=10)
-        return r.json().get('news',[])[:15] if r.ok else []
-    except Exception:return []
-
-def quote_url(s):return urlquote(s)
+def quote_url(s):return url_quote(s)
 
 def pnl(t,price):
     return (price-t['Entry'])*t['Quantity'] if t['Side']=='BUY' else (t['Entry']-price)*t['Quantity']
 
 def close_trade(i,price):
-    t=st.session_state.paper_trades[i]; p=pnl(t,price); t['Exit']=price; t['Exit Time']=datetime.now().strftime('%Y-%m-%d %H:%M:%S'); t['Final P/L']=p; t['Status']='CLOSED'; st.session_state.realized_pnl = st.session_state.get('realized_pnl',0.0)+p; st.session_state.balance += p
+    t=st.session_state.paper_trades[i]; p=pnl(t,price); t['Exit']=price; t['Exit Time']=datetime.now().strftime('%Y-%m-%d %H:%M:%S'); t['Final P/L']=p; t['Status']='CLOSED'; st.session_state.realized_pnl += p
 
 
 def trend_analysis(d):
@@ -346,6 +338,7 @@ def multifactor_signal(row, d, pcr=None, pattern_bias=0):
     strength = strength_from_score(final_score, vol_ok)
     confirmation = (base_sig == 'BUY' and (vol_ok or pcr_score > 0)) or (base_sig == 'SELL' and (vol_ok or pcr_score < 0))
     return strength, final_score, volume_label, volume_ratio, pcr_label, confirmation
+
 
 def enhanced_signal(base_sig, base_score, pattern_bias, news_info, macro_score, institutional_score, basket_score, pcr):
     score=float(base_score)
@@ -470,18 +463,7 @@ def backtest(symbol, period):
     bt=pd.DataFrame(records)
     if bt.empty:return bt,{}
     wins=int((bt['Outcome']=='WIN').sum()); losses=int((bt['Outcome']=='LOSS').sum()); flats=int((bt['Outcome']=='FLAT').sum()); total=len(bt)
-    buy=bt[bt.Signal=='BUY']; sell=bt[bt.Signal=='SELL']
-    equity=bt['Return %'].cumsum(); dd=(equity.cummax()-equity)
-    stats={
-        'signals':total,'wins':wins,'losses':losses,'flats':flats,
-        'win_rate':wins/total*100,'loss_rate':losses/total*100,
-        'avg_return':float(bt['Return %'].mean()),'net_return_pct':float(bt['Return %'].sum()),
-        'max_drawdown_pct':float(dd.max()),'buy_trades':int(len(buy)),'sell_trades':int(len(sell)),
-        'buy_wins':int((buy['Outcome']=='WIN').sum()),'buy_losses':int((buy['Outcome']=='LOSS').sum()),
-        'sell_wins':int((sell['Outcome']=='WIN').sum()),'sell_losses':int((sell['Outcome']=='LOSS').sum()),
-        'buy_win_rate':float((buy['Outcome']=='WIN').mean()*100) if len(buy) else np.nan,
-        'sell_win_rate':float((sell['Outcome']=='WIN').mean()*100) if len(sell) else np.nan,
-    }
+    stats={'signals':total,'wins':wins,'losses':losses,'flats':flats,'win_rate':wins/total*100,'loss_rate':losses/total*100,'avg_return':float(bt['Return %'].mean()),'net_return_pct':float(bt['Return %'].sum()),'max_drawdown_pct':float((bt['Return %'].cumsum().cummax()-bt['Return %'].cumsum()).max()) if len(bt) else 0.0,'buy_trades':int((bt[bt.Signal=='BUY']).shape[0]),'sell_trades':int((bt[bt.Signal=='SELL']).shape[0]),'buy_wins':int((bt[(bt.Signal=='BUY') & (bt.Outcome=='WIN')]).shape[0]),'buy_losses':int((bt[(bt.Signal=='BUY') & (bt.Outcome=='LOSS')]).shape[0]),'sell_wins':int((bt[(bt.Signal=='SELL') & (bt.Outcome=='WIN')]).shape[0]),'sell_losses':int((bt[(bt.Signal=='SELL') & (bt.Outcome=='LOSS')]).shape[0]),'buy_win_rate':float((bt[(bt.Signal=='BUY') & (bt.Outcome=='WIN')].shape[0]/max(1, (bt.Signal=='BUY').sum())*100)) if (bt.Signal=='BUY').sum() else np.nan,'sell_win_rate':float((bt[(bt.Signal=='SELL') & (bt.Outcome=='WIN')].shape[0]/max(1, (bt.Signal=='SELL').sum())*100)) if (bt.Signal=='SELL').sum() else np.nan}
     return bt,stats
 
 
@@ -501,6 +483,7 @@ def backtest_diagnostics(bt):
     buckets.append(('Stop Loss Hit', len(losses)))
     diag=pd.DataFrame(buckets,columns=['Diagnostic','Count']).sort_values('Count',ascending=False)
     return diag, 'These are observable conditions present in losing trades, not proof that any single factor caused the loss. The ensemble gate is designed to filter several weaker setups.'
+
 
 @st.cache_data(ttl=60, show_spinner=False)
 def option_pcr(symbol):
@@ -563,15 +546,16 @@ def opening_analysis(sym, d):
     bias = 'BULLISH' if score >= 4 else 'BEARISH' if score <= 1 else 'NEUTRAL / MIXED'
     return {'prev_close': prev_close, 'estimated_low': lower, 'estimated_high': upper, 'estimated_mid': mid, 'bias': bias, 'factor_score': score, 'factors': global_scores}
 
+
+# ---------------- LIVE NEWS / CRITICAL ANALYSIS ----------------
 @st.cache_data(ttl=90, show_spinner=False)
 def live_news_feed(symbol, name):
     """Fetch recent Yahoo Finance search news for the selected instrument and India/global risk themes."""
-    queries = [name, f"{name} India stock market", "India markets RBI Fed crude oil geopolitical", "India government support sector infrastructure defence semiconductor renewable energy", "India major company earnings or announcements"]
-    out=[]; seen=set()
-    headers={'User-Agent':'Mozilla/5.0'}
+    queries = [name, f"{name} India stock market", "India markets RBI Fed crude oil geopolitical", "India government support sector infrastructure defence semiconductor renewable energy", "India market volatility geopolitical risk and crude oil outlook"]
+    out=[]; seen=set(); headers={'User-Agent':'Mozilla/5.0'}
     for q in queries:
         try:
-            u='https://query1.finance.yahoo.com/v1/finance/search?q='+urlquote(q)+'&newsCount=10'
+            u='https://query1.finance.yahoo.com/v1/finance/search?q='+url_quote(q)+'&newsCount=10'
             r=requests.get(u,headers=headers,timeout=8)
             if not r.ok: continue
             for item in r.json().get('news',[])[:10]:
@@ -617,8 +601,9 @@ def critical_market_analysis(strength, mf_score, trend, volume_ratio, pcr, news_
     if score>=4: action='CALL BIAS / BULLISH SETUP'
     elif score<=-4: action='PUT BIAS / BEARISH SETUP'
     else: action='NO OPTION BIAS / WAIT'
-    if abs(price-prev_close)/prev_close<0.002: factors.append('Price is close to previous close; confirmation preferred')
+    if abs(price-prev_close)/prev_close < 0.002: factors.append('Price is close to previous close; confirmation preferred')
     return {'score':score,'action':action,'factors':factors}
+
 
 # ---------------- REQUIREMENT HELPERS ----------------
 def market_status():
@@ -643,12 +628,10 @@ def fii_dii_feed():
         ss=requests.Session(); ss.get('https://www.nseindia.com/',headers=h,timeout=8)
         r=ss.get('https://www.nseindia.com/api/fiidiiTradeReact',headers=h,timeout=8)
         if not r.ok: return pd.DataFrame()
-        payload=r.json()
-        rows=payload if isinstance(payload,list) else payload.get('data',[])
+        payload=r.json(); rows=payload if isinstance(payload,list) else payload.get('data',[])
         out=[]
         for x in rows:
-            if not isinstance(x,dict): continue
-            out.append(x)
+            if isinstance(x,dict): out.append(x)
         return pd.DataFrame(out)
     except Exception:
         return pd.DataFrame()
@@ -785,7 +768,6 @@ for key in ('USD/INR','Crude Oil'):
     if pd.notna(ch):
         macro_score += (-1 if key=='USD/INR' and ch>0.2 else 1 if key=='USD/INR' and ch<-0.2 else 0)
         macro_score += (-1 if key=='Crude Oil' and ch>0.8 else 1 if key=='Crude Oil' and ch<-0.8 else 0)
-
 sig,mf_score,strength,live_confirmation=enhanced_signal(sig, mf_score, pattern_bias, news_info, macro_score, institutional_score, basket_score, pcr_oi)
 score=mf_score
 levels=trade_levels(price,last,strength)
@@ -797,7 +779,7 @@ if pd.notna(hit_rate) and float(hit_rate)<50:
     confidence_reasons.append('Historical hit rate below 50%; confidence capped at 60%')
 trend_idx, trend_upper, trend_lower, trend_slope = trendline_values(d)
 
-m=st.columns(7); m[0].metric('Live Price',fmt_price(price),fmt_num(change,2,'',''));m[1].metric('Change',fmt_pct(pct));m[2].metric('RSI',fmt_num(last.RSI));m[3].metric('MACD',fmt_num(last.MACD));m[4].metric('Signal',sig);m[5].metric('Trend',trend_now);m[6].metric('Volume',vol_label)
+m=st.columns(7); m[0].metric('Live Price',fmt_price(price),fmt_num(change,2,'',''));m[1].metric('Change',fmt_pct(pct));m[2].metric('RSI',fmt_num(last.RSI));m[3].metric('MACD',fmt_num(last.MACD));m[4].metric('Signal',sig,f'{strength}');m[5].metric('Volume',vol_label,f'{vol_ratio:.2f}x');m[6].metric('Trend',trend_now)
 st.metric('Signal',sig,f'{strength} | Score {mf_score}/10')
 st.caption(f"VWAP status: {d.attrs.get('vwap_status','N/A')} | PCR status: {pcr_status}")
 
@@ -906,7 +888,7 @@ q5.metric('Confirmation','YES' if live_confirmation else 'WAIT')
 
 tabs=st.tabs(['Indicators','Patterns','Backtest','Paper Trading','Market','Pre-Open','Options','News','Data','FII/DII & Risk','Settings'])
 with tabs[0]:
-    c1,c2,c3=st.columns(3);c1.metric('EMA 5',f'{last.EMA5:.2f}');c1.metric('EMA 21',f'{last.EMA21:.2f}');c1.metric('EMA 50',f'{last.EMA50:.2f}');c2.metric('EMA 200',f'{last.EMA200:.2f}');c2.metric('ATR',f'{last.ATR:.2f}');c3.metric('ADX',f'{last.ADX:.2f}')
+    c1,c2,c3=st.columns(3);c1.metric('EMA 5',f'{last.EMA5:.2f}');c1.metric('EMA 21',f'{last.EMA21:.2f}');c1.metric('EMA 50',f'{last.EMA50:.2f}');c2.metric('EMA 200',f'{last.EMA200:.2f}');c2.metric('VWAP',f'{last.VWAP:.2f}');c3.metric('ATR',f'{last.ATR:.2f}')
     a,b=st.columns(2)
     with a:
         f=go.Figure();f.add_trace(go.Scatter(x=d.index,y=d.MACD,name='MACD'));f.add_trace(go.Scatter(x=d.index,y=d.MACD_SIGNAL,name='Signal'));f.add_bar(x=d.index,y=d.MACD_HIST,name='Histogram');f.update_layout(height=320,template='plotly_dark',title='MACD');st.plotly_chart(f,use_container_width=True)
@@ -948,17 +930,14 @@ with tabs[2]:
         x3.metric('BUY Hit Rate',f"{stats['buy_win_rate']:.2f}%" if pd.notna(stats['buy_win_rate']) else 'N/A')
         x4.metric('SELL Hit Rate',f"{stats['sell_win_rate']:.2f}%" if pd.notna(stats['sell_win_rate']) else 'N/A')
         st.dataframe(bt.tail(300),use_container_width=True,hide_index=True)
-        st.caption('Historical simulation only. Entry is next-day open; risk model uses 1 ATR stop and 2 ATR target with a 10-bar maximum holding period.')
     else:
         st.warning('Not enough historical data for this backtest period.')
-
     st.subheader('[CONFIDENCE] Current Setup')
     cc1,cc2,cc3=st.columns(3)
     cc1.metric('Current Signal',sig)
     cc2.metric('Confidence',f'{confidence}%')
     cc3.metric('Historical Direction Hit Rate',f"{summary_stats.get('buy_win_rate' if sig=='BUY' else 'sell_win_rate',np.nan):.2f}%" if summary_stats and pd.notna(summary_stats.get('buy_win_rate' if sig=='BUY' else 'sell_win_rate',np.nan)) else 'N/A')
     st.write('Why:', ' | '.join(confidence_reasons[:10]) if confidence_reasons else 'No strong confirming factors')
-
 with tabs[3]:
     st.subheader('[PAPER] Paper Trading')
     a,b,c=st.columns(3)
@@ -968,8 +947,8 @@ with tabs[3]:
         default_target=levels['Target 1'] if levels['Direction']==side and pd.notna(levels['Target 1']) else (price+2*(float(last.ATR) if pd.notna(last.ATR) else price*.01) if side=='BUY' else price-2*(float(last.ATR) if pd.notna(last.ATR) else price*.01))
         sl=st.number_input('Stop Loss',0.0,value=float(max(.01,default_sl)),step=.05);target=st.number_input('Target 1',0.0,value=float(max(.01,default_target)),step=.05)
     with c:
-        est=(price-entry)*qty if side=='BUY' else (entry-price)*qty;st.metric('Live P/L',f'{est:+,.2f}');st.metric('Paper Balance',f'{st.session_state.balance:,.2f}');st.metric('Realized P/L',f'{st.session_state.realized_pnl:+,.2f}')
-    if st.button('Open Paper Position',use_container_width=True):
+        est=(price-entry)*qty if side=='BUY' else (entry-price)*qty;st.metric('Live P/L',f'{est:+,.2f}');st.metric('Paper Balance',f'{st.session_state.balance:,.2f}');st.metric('Realized P/L',f'{st.session_state.realized_pnl:,.2f}')
+    if st.button('??| Open Paper Position',use_container_width=True):
         st.session_state.paper_trades.append({'Symbol':symbol,'Side':side,'Quantity':float(qty),'Entry':float(entry),'Stop Loss':float(sl),'Target':float(target),'Opened':datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'Status':'OPEN'})
     if st.session_state.paper_trades:
         rows=[]
@@ -980,7 +959,7 @@ with tabs[3]:
         if opens:
             i=st.selectbox('Open position to exit',opens,format_func=lambda x:f"#{x+1} {st.session_state.paper_trades[x]['Symbol']} {st.session_state.paper_trades[x]['Side']}")
             ep=st.number_input('Exit Price',0.0,value=price,step=.05)
-            if st.button('Exit Selected Position',use_container_width=True):close_trade(i,ep);st.rerun()
+            if st.button('??" Exit Selected Position',use_container_width=True):close_trade(i,ep);st.rerun()
     else:st.info('No paper positions.')
 with tabs[4]:
     st.subheader('[MARKET] Market Overview')
@@ -1008,7 +987,7 @@ with tabs[4]:
     for n,s in NIFTY.items():
         q,ch=quote(s)
         if pd.notna(ch):
-            status='Advance' if ch>.05 else 'Decline' if ch<-.05 else 'Unchanged';adv+=status=='Advance';dec+=status=='Decline';unch+=status=='Unchanged';rows.append({'Stock':n,'Change %':ch,'Status':status})
+            status='Advance' if ch>.05 else 'Decline' if ch<-.05 else 'Unchanged';adv+=status=='Advance';dec+=status=='Decline';unch+=status=='Unchanged';rows.append({'Stock':n,'Change %':ch})
     a,b,c,e=st.columns(4);a.metric('Advances',adv);b.metric('Declines',dec);c.metric('Unchanged',unch);e.metric('A/D Ratio',f'{adv/dec:.2f}' if dec else 'INF')
     if rows:st.dataframe(pd.DataFrame(rows).sort_values('Change %',ascending=False),use_container_width=True,hide_index=True)
     st.subheader('[NEWS] Critical News Context')
@@ -1030,11 +1009,10 @@ with tabs[5]:
             st.success('Official NSE pre-open snapshot received.')
             st.json(pre)
         else:
-            st.warning('Official NSE indicative pre-open data was not reachable from this Streamlit environment. The displayed range is an estimate from previous close/ATR and market factors, not an official pre-open equilibrium.')
-        st.caption("NSE pre-open session is 9:00 to 9:15 IST; when an equilibrium price is discovered, it becomes the day's open price. The app labels its fallback range as an estimate rather than a live official quote.")
+            st.warning('Official NSE indicative pre-open data was not reachable from this Streamlit environment. The displayed range is an estimate from previous close/ATR and market factors, not an official quote.')
+        st.caption("NSE pre-open session is 9:00 to 9:15 IST; when an equilibrium price is discovered, it becomes the day's open price.")
     else:
         st.info('Pre-open analysis unavailable for this symbol.')
-
 with tabs[6]:
     st.subheader('[ANALYSIS]? Options Analysis')
     if not pcr_summary.empty:
@@ -1042,7 +1020,7 @@ with tabs[6]:
         st.metric('OI PCR',f"{pcr_oi:.2f}" if pd.notna(pcr_oi) else 'N/A')
     else:
         st.warning('Live option-chain PCR unavailable for this symbol. Select an index/option-enabled underlying.')
-    st.selectbox('Underlying',['NIFTY','BANKNIFTY','RELIANCE','TCS','INFY','HDFCBANK']);st.info('Production integration can populate expiry, strike-wise CE/PE OI, volume, IV, PCR and Max Pain using a reliable exchange feed.')
+    st.selectbox('Underlying',['NIFTY','BANKNIFTY','RELIANCE','TCS','INFY','HDFCBANK']);st.info('Production integration can populate expiry, strike-wise CE/PE OI, volume, IV, PCR and Max Pain using a broker/data API.')
 with tabs[7]:
     st.subheader('[NEWS] Market & Geopolitical News')
     st.metric('Critical News Bias',news_info['bias'],f"Risk {news_info['risk']}")
@@ -1052,9 +1030,8 @@ with tabs[7]:
             title=item.get('title','Untitled');link=item.get('link','');pub=item.get('publisher','');st.markdown(f'### [{title}]({link})' if link else f'### {title}');st.caption(pub)
     else:st.info('News temporarily unavailable.')
 with tabs[8]:
-    cols=['Open','High','Low','Close','Volume','EMA5','EMA21','EMA50','EMA200','VWAP','RSI','MACD','MACD_SIGNAL','ATR','ADX','BB_UPPER','BB_MID','BB_LOWER','STOCH_K','STOCH_D','CCI','SUPPORT','RESISTANCE','PIVOT','R1','S1','R2','S2']
-    st.dataframe(d[cols].tail(50),use_container_width=True,hide_index=True)
-
+    cols=['Open','High','Low','Close','Volume','EMA5','EMA21','EMA50','EMA200','VWAP','RSI','MACD','MACD_SIGNAL','ATR','ADX','BB_UPPER','BB_MID','BB_LOWER','STOCH_K','STOCH_D','CCI','SUPPORT','RESISTANCE','PIVOT','R1','S1']
+    st.dataframe(d[cols].tail(500) if all(c in d.columns for c in cols) else d.tail(500),use_container_width=True,hide_index=True)
 with tabs[9]:
     st.subheader('[FII/DII] FII / DII Activity')
     fd=fii_dii_feed()
@@ -1069,7 +1046,6 @@ with tabs[9]:
     qty_s,risk_cash=risk_position_size(rs_entry,rs_sl,st.session_state.balance,st.session_state.risk_per_trade,st.session_state.max_position_value)
     r1,r2,r3=st.columns(3);r1.metric('Suggested Qty',qty_s);r2.metric('Max Risk',f'{risk_cash:,.2f}');r3.metric('Risk %',f"{st.session_state.risk_per_trade:.2f}%")
     st.caption('Position size is a rule-based risk calculation, not a guarantee or order instruction.')
-
 with tabs[10]:
     st.subheader('[SETTINGS] Settings & Data Controls')
     st.write('**Login:** username `admin`; initial password is `admin123`. The demo recovery PIN defaults to `1234` unless TRADING_RECOVERY_PIN is set.')
@@ -1080,5 +1056,5 @@ with tabs[10]:
 
 st.divider();st.subheader('[BROKER] Broker Integration')
 a,b,c,e=st.columns(4);a.metric('Angel One','API Ready');b.metric('Upstox','API Ready');c.metric('Delta Exchange','API Ready');e.metric('Sahi','API Ready')
-st.caption('Paper trading is functional. Real broker order execution requires your authorized API credentials and the broker current official API/SDK contract; this app does not place real orders by default.')
+st.caption('Paper trading is functional. Real broker order execution requires your authorized API credentials and the broker current official API/SDK contract; this app does not place real orders.')
 st.info('Market data can be delayed, incomplete, or unavailable. Signals are informational and are not guaranteed investment advice.')
