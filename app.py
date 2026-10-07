@@ -3,8 +3,7 @@ import pandas as pd
 import streamlit as st
 
 # -----------------------------------------------------------------------------
-# STARTUP SAFETY: some Streamlit apps define these values later in the script.
-# If they are not created yet, use safe defaults so the app doesn't crash on load.
+# STARTUP SAFETY: avoid crashes when a value or helper is defined later in the app.
 # -----------------------------------------------------------------------------
 for _name, _value in {
     "price": 0.0,
@@ -39,13 +38,15 @@ for _name, _value in {
     "hit_rate": np.nan,
     "trend_now": "UNKNOWN",
     "prev_close_now": 0.0,
+    "current_patterns": [],
+    "option_suggest": [],
+    "option_suggest_status": "N/A",
 }.items():
     globals().setdefault(_name, _value)
 
 
-# Fallbacks for optional modules/features that may not exist when the app boots.
 def update_open_paper_positions(price):
-    """Return paper-trading events without crashing if there are no positions yet."""
+    """Paper trading P/L updater with safe empty-state behavior."""
     try:
         positions = st.session_state.get("paper_positions", [])
     except Exception:
@@ -77,7 +78,7 @@ def update_open_paper_positions(price):
     return events
 
 
-# If a helper isn't imported yet, keep the app alive with a safe stub.
+# If helper functions are not imported yet, bind safe placeholders so the app loads.
 for _name, _func in {
     "option_pcr": lambda *args, **kwargs: (0.0, "", "N/A"),
     "candle_pattern_bias": lambda *args, **kwargs: (0, []),
@@ -97,11 +98,12 @@ for _name, _func in {
     "enhanced_signal": lambda *args, **kwargs: ("WAIT", 0.0, "NO SIGNAL", False),
     "trendline_values": lambda *args, **kwargs: (0, 0.0, 0.0, 0.0),
     "confidence_score": lambda *args, **kwargs: (0, []),
+    "critical_market_analysis": lambda *args, **kwargs: "Market data unavailable",
 }.items():
     globals().setdefault(_name, _func)
 
 
-# Safe call for paper positions. This prevents the NameError when price is not ready.
+# Safe paper-position call.
 auto_events = []
 try:
     if callable(globals().get("update_open_paper_positions")):
