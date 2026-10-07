@@ -38,9 +38,12 @@ def update_open_paper_positions(price):
     return events
 
 
-if callable(globals().get('update_open_paper_positions')):
-    auto_events = update_open_paper_positions(price)
-else:
+# Safely update paper positions only if price is available
+auto_events = []
+try:
+    if 'price' in locals() and price is not None:
+        auto_events = update_open_paper_positions(price)
+except Exception:
     auto_events = []
 
 if auto_events:
