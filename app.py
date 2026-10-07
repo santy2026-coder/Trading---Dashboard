@@ -1,3 +1,43 @@
+def update_open_paper_positions(price):
+    """Refresh open paper-trading positions and return toast messages."""
+    if "paper_positions" not in st.session_state:
+        st.session_state.paper_positions = []
+
+    positions = st.session_state.get("paper_positions", [])
+    if not positions:
+        return []
+
+    events = []
+    try:
+        current_price = float(price)
+    except (TypeError, ValueError):
+        return []
+
+    for pos in positions:
+        try:
+            symbol = pos.get("symbol", "POSITION")
+            side = str(pos.get("side", "BUY")).upper()
+            entry = float(pos.get("entry", 0.0) or 0.0)
+            qty = float(pos.get("qty", 0.0) or 0.0)
+
+            if qty == 0:
+                continue
+
+            if side == "BUY":
+                pnl = (current_price - entry) * qty
+            else:
+                pnl = (entry - current_price) * qty
+
+            pos["last_price"] = current_price
+            pos["pnl"] = pnl
+            pos["pnl_pct"] = (pnl / (abs(entry * qty) if abs(entry * qty) else 1.0)) * 100.0
+            events.append(f"{symbol}: {side} P/L = ₹{pnl:,.2f}")
+        except Exception:
+            continue
+
+    return events
+
+
 if callable(globals().get('update_open_paper_positions')):
     auto_events = update_open_paper_positions(price)
 else:
