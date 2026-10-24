@@ -47,6 +47,67 @@ SYMBOLS = {
 GLOBAL = {'US S&P 500':'^GSPC','US Nasdaq':'^IXIC','US Dow Jones':'^DJI','Japan Nikkei':'^N225','Hong Kong Hang Seng':'^HSI','China Shanghai':'000001.SS','South Korea KOSPI':'^KS11','Brent Crude':'BZ=F','USD/INR':'INR=X','India VIX':'^INDIAVIX'}
 
 ANGEL_MASTER_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
+ANGEL_PCR_URL = "https://apiconnect.angelone.in/rest/secure/angelbroking/marketData/v1/putCallRatio"
+
+# PCR is fetched from the authenticated Angel One SmartAPI (not scraped from NSE).
+PCR_ALIASES = {
+    "NIFTY 50": ("NIFTY",), "BANK NIFTY": ("BANKNIFTY", "NIFTYBANK"),
+    "NIFTY IT": ("CNXIT", "NIFTYIT"), "NIFTY AUTO": ("CNXAUTO", "NIFTYAUTO"),
+    "RELIANCE": ("RELIANCE",), "HDFC BANK": ("HDFCBANK",), "ICICI BANK": ("ICICIBANK",),
+    "SBI": ("SBIN",), "AXIS BANK": ("AXISBANK",), "KOTAK BANK": ("KOTAKBANK",),
+    "TCS": ("TCS",), "INFOSYS": ("INFY", "INFOSYS"), "HCLTECH": ("HCLTECH",),
+    "WIPRO": ("WIPRO",), "TECH MAHINDRA": ("TECHM",), "MARUTI": ("MARUTI",),
+    "M&M": ("M&M", "MM"), "TATA MOTORS": ("TATAMOTORS", "TMPV"),
+    "BAJAJ AUTO": ("BAJAJ-AUTO", "BAJAJAUTO"), "EICHER MOTORS": ("EICHERMOT",),
+}
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_angel_pcr_snapshot(jwt_token, api_key, client_code, market_name):
+    """Fetch cumulative options PCR from Angel One's authenticated SmartAPI."""
+    if not jwt_token or not api_key:
+        return {"ok": False, "error": "Connect Angel One to load automatic PCR."}
+    try:
+        public_ip = "127.0.0.1"
+        try:
+            public_ip = requests.get("https://api.ipify.org", timeout=3).text.strip() or public_ip
+        except Exception:
+            pass
+        headers = {
+            "Authorization": "Bearer " + str(jwt_token).replace("Bearer ", ""),
+            "Content-Type": "application/json", "Accept": "application/json",
+            "X-UserType": "USER", "X-SourceID": "WEB",
+            "X-ClientLocalIP": "127.0.0.1", "X-ClientPublicIP": public_ip,
+            "X-MACAddress": "00:00:00:00:00:00", "X-PrivateKey": str(api_key),
+        }
+        response = requests.get(ANGEL_PCR_URL, headers=headers, timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("status"):
+            return {"ok": False, "error": str(payload.get("message") or payload.get("errorcode") or "Angel One PCR request failed")}
+        rows = payload.get("data") or []
+        aliases = PCR_ALIASES.get(market_name)
+        if market_name == "Custom Yahoo ticker":
+            aliases = ()
+        if not aliases:
+            return {"ok": False, "error": "Automatic PCR mapping is not available for this instrument."}
+        matched = []
+        for row in rows:
+            tsym = str(row.get("tradingSymbol", "")).upper()
+            # PCR API maps option PCR to the underlying futures trading symbol.
+            if any(tsym.startswith(a.upper()) for a in aliases):
+                try:
+                    val = float(row.get("pcr"))
+                    if np.isfinite(val) and val > 0:
+                        matched.append({"pcr": val, "symbol": tsym})
+                except Exception:
+                    pass
+        if not matched:
+            return {"ok": False, "error": "Angel One returned no PCR row for the selected underlying."}
+        # Prefer the first exact underlying match from the API's response list.
+        return {"ok": True, **matched[0], "source": "Angel One SmartAPI", "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    except Exception as exc:
+        return {"ok": False, "error": f"Angel One PCR feed unavailable: {exc}"}
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_angel_master():
@@ -289,6 +350,70 @@ def mtf(ticker):
         z=indicators(x); r=z.iloc[-1]; sig,_,_,_=get_signal(r)
         out.append({'Timeframe':label,'Trend':'Bullish' if r.ema20>r.ema50 else 'Bearish' if r.ema20<r.ema50 else 'Sideways','Signal':sig,'RSI':safe(r.rsi),'ADX':safe(r.adx),'Last candle':str(z.index[-1])})
     return pd.DataFrame(out)
+def adaptive_atr_multiplier(price_value, atr_value, adx_value=np.nan):
+    """Return a volatility-adjusted ATR stop multiplier; this is a rule, not a guarantee."""
+    pv=safe(price_value); av=safe(atr_value); ax=safe(adx_value)
+    if not np.isfinite(pv) or pv<=0 or not np.isfinite(av) or av<=0:
+        return 1.5
+    atr_pct=av/pv*100
+    if atr_pct < 0.35: mult=1.20
+    elif atr_pct < 0.75: mult=1.50
+    elif atr_pct < 1.25: mult=1.80
+    elif atr_pct < 2.00: mult=2.20
+    else: mult=2.60
+    if np.isfinite(ax) and ax>=30: mult+=0.20
+    elif np.isfinite(ax) and ax<15: mult-=0.10
+    return float(np.clip(mult,1.0,3.0))
+
+@st.cache_data(ttl=300, show_spinner=False)
+def global_context_changes():
+    """Best-effort daily changes; missing/failed quotes stay unavailable."""
+    mapping={"S&P 500":"^GSPC", "Nasdaq":"^IXIC", "Brent":"BZ=F", "USD/INR":"INR=X", "India VIX":"^INDIAVIX"}
+    out={}
+    for label,tick in mapping.items():
+        q=yahoo(tick,"5d","1d")
+        out[label]=pct(q.close) if not q.empty else np.nan
+    return out
+
+def combined_confidence(last_row, bull_score, bear_score, pcr_value, fii_value, dii_value, news_bias, event_risk, pattern_list):
+    """Directional confluence score (not a probability of profit). Missing feeds lower coverage."""
+    factors=[]
+    # Technical direction from the same indicators used by the signal engine.
+    tech_dir=1 if bull_score>bear_score else -1 if bear_score>bull_score else 0
+    factors.append(("Technical score",tech_dir,2.0,True))
+    factors.append(("EMA trend",1 if last_row.ema20>last_row.ema50 else -1 if last_row.ema20<last_row.ema50 else 0,1.0,pd.notna(last_row.ema20) and pd.notna(last_row.ema50)))
+    factors.append(("MACD",1 if last_row.macd>last_row.macd_signal else -1 if last_row.macd<last_row.macd_signal else 0,1.0,pd.notna(last_row.macd) and pd.notna(last_row.macd_signal)))
+    rsi=safe(last_row.rsi); factors.append(("RSI",1 if 52<=rsi<=70 else -1 if 30<=rsi<=48 else 0,.7,np.isfinite(rsi)))
+    pat_bull=any("Bullish" in x or "Hammer" in x or "Morning Star" in x or "White Soldiers" in x for x in pattern_list)
+    pat_bear=any("Bearish" in x or "Shooting Star" in x or "Evening Star" in x or "Black Crows" in x for x in pattern_list)
+    factors.append(("Candlestick patterns",1 if pat_bull and not pat_bear else -1 if pat_bear and not pat_bull else 0,1.0,not (pattern_list==['No major pattern detected'] or pattern_list==['Insufficient candles'])))
+    factors.append(("PCR",1 if np.isfinite(pcr_value) and pcr_value>=1.15 else -1 if np.isfinite(pcr_value) and pcr_value<=.80 else 0,.6,np.isfinite(pcr_value)))
+    # Cash-market FII/DII values are user-entered fallback unless a separate authorized feed is connected.
+    factors.append(("FII/FPI",1 if np.isfinite(fii_value) and fii_value>0 else -1 if np.isfinite(fii_value) and fii_value<0 else 0,.5,np.isfinite(fii_value)))
+    factors.append(("DII",1 if np.isfinite(dii_value) and dii_value>0 else -1 if np.isfinite(dii_value) and dii_value<0 else 0,.35,np.isfinite(dii_value)))
+    glob=global_context_changes()
+    for label,weight in [("S&P 500",.35),("Nasdaq",.35)]:
+        v=glob.get(label,np.nan); factors.append((label,1 if np.isfinite(v) and v>.15 else -1 if np.isfinite(v) and v<-.15 else 0,weight,np.isfinite(v)))
+    # These are context flags, not hard-coded claims about market direction.
+    for label in ("Brent","USD/INR","India VIX"):
+        factors.append((label,0,.2,np.isfinite(glob.get(label,np.nan))))
+    if news_bias=='Positive': factors.append(("News",1,.5,True))
+    elif news_bias=='Negative': factors.append(("News",-1,.5,True))
+    elif news_bias=='Mixed': factors.append(("News",0,.5,True))
+    else: factors.append(("News",0,.5,False))
+    if event_risk=='High': factors.append(("Event risk",0,1.0,True))
+    elif event_risk in ('Low','Moderate'): factors.append(("Event risk",0,.5,True))
+    else: factors.append(("Event risk",0,.5,False))
+    available=[f for f in factors if f[3]]
+    if not available: return 5,0,0,len(factors),0,glob
+    directional_weight=sum(w for _,d,w,_ in available if d!=0)
+    agree_weight=sum(w for _,d,w,_ in available if d==tech_dir and d!=0) if tech_dir else 0
+    coverage=sum(w for _,_,w,_ in available)/sum(w for _,_,w,_ in factors)
+    agreement=(agree_weight/directional_weight) if directional_weight else .5
+    # A conservative bounded confluence index; not a calibrated probability.
+    score=round(float(np.clip((50+35*(agreement-.5))*coverage,5,95)))
+    return score, int(sum(1 for _,d,_,ok in available if ok and d==1)), int(sum(1 for _,d,_,ok in available if ok and d==-1)), len(factors), round(coverage*100), glob
+
 def backtest(x,rr,atrmult,cost_bps):
     d=indicators(x); trades=[]; pos=None; fee=cost_bps/10000
     if len(d)<60:return pd.DataFrame(),{'Total Trades':0,'Wins':0,'Losses':0,'Win Rate %':0,'Net Return %':0,'Profit Factor':np.nan,'Max Drawdown %':0}
@@ -304,15 +429,16 @@ def backtest(x,rr,atrmult,cost_bps):
             else:
                 av=safe(r.atr)
                 if np.isfinite(av) and av>0:
-                    pos['stop']=max(pos['stop'],r.close-atrmult*av) if pos['side']=='LONG' else min(pos['stop'],r.close+atrmult*av)
+                    current_mult=adaptive_atr_multiplier(r.close,av,r.adx)
+                    pos['stop']=max(pos['stop'],r.close-current_mult*av) if pos['side']=='LONG' else min(pos['stop'],r.close+current_mult*av)
             if exitp is not None:
                 gross=(exitp-pos['entry'])/pos['entry'] if pos['side']=='LONG' else (pos['entry']-exitp)/pos['entry']; net=(gross-2*fee)*100
                 trades.append({'Entry Time':pos['time'],'Exit Time':str(d.index[i]),'Side':pos['side'],'Entry':pos['entry'],'Exit':exitp,'Net Return %':net,'Result':'Win' if net>0 else 'Loss','Exit Reason':reason});pos=None
         if pos is None and sig in ('BUY','SELL'):
             av=safe(r.atr); ep=safe(nxt.open)
             if not np.isfinite(av) or av<=0 or not np.isfinite(ep) or ep<=0:continue
-            side='LONG' if sig=='BUY' else 'SHORT'; risk=av*atrmult
-            pos={'side':side,'entry':ep,'stop':ep-risk if side=='LONG' else ep+risk,'target':ep+risk*rr if side=='LONG' else ep-risk*rr,'time':str(d.index[i+1])}
+            side='LONG' if sig=='BUY' else 'SHORT'; entry_mult=adaptive_atr_multiplier(ep,av,r.adx); risk=av*entry_mult
+            pos={'side':side,'entry':ep,'stop':ep-risk if side=='LONG' else ep+risk,'target':ep+risk*rr if side=='LONG' else ep-risk*rr,'time':str(d.index[i+1]),'ATR Multiplier':entry_mult}
     t=pd.DataFrame(trades)
     if t.empty:return t,{'Total Trades':0,'Wins':0,'Losses':0,'Win Rate %':0,'Net Return %':0,'Profit Factor':np.nan,'Max Drawdown %':0}
     wins=int((t['Net Return %']>0).sum()); losses=len(t)-wins; gp=t.loc[t['Net Return %']>0,'Net Return %'].sum(); gl=abs(t.loc[t['Net Return %']<=0,'Net Return %'].sum()); eq=(1+t['Net Return %']/100).cumprod(); dd=(eq/eq.cummax()-1).min()*100
@@ -372,19 +498,45 @@ if st.sidebar.button('Refresh now',type='primary'):
     st.cache_data.clear()
     st.session_state.force_angel_refresh=True
     st.rerun()
-rr=st.sidebar.selectbox('Target risk : reward',[1.0,1.5,2.0,3.0],index=2); atr_mult=st.sidebar.slider('ATR stop multiplier',0.5,4.0,1.5,0.25); risk_pct=st.sidebar.slider('Paper risk per trade (%)',0.25,2.0,1.0,0.25); capital=st.sidebar.number_input('Paper capital (₹)',min_value=1000.0,value=100000.0,step=5000.0)
+rr=st.sidebar.selectbox('Target risk : reward',[1.0,1.5,2.0,3.0],index=2)
+st.sidebar.info('ATR stop multiplier: AUTO — adapts to ATR volatility and ADX trend strength.')
+risk_pct=st.sidebar.slider('Paper risk per trade (%)',0.25,2.0,1.0,0.25); capital=st.sidebar.number_input('Paper capital (₹)',min_value=1000.0,value=100000.0,step=5000.0)
 st.sidebar.divider()
-st.sidebar.subheader('Manual context data (if unavailable from feed)')
-pcr=st.sidebar.number_input('PCR',0.0,10.0,1.0,.05)
-pcr_delta=st.sidebar.number_input('PCR change',value=0.0,step=.01)
-pcr_bias=st.sidebar.selectbox('PCR interpretation',['Not assessed','Bullish','Bearish','Mixed'])
-call_oi=st.sidebar.number_input('Call OI change (%)',value=0.0,step=1.0)
-put_oi=st.sidebar.number_input('Put OI change (%)',value=0.0,step=1.0)
-fii=st.sidebar.number_input('FII/FPI net (₹ crore)',value=0.0,step=100.0)
-dii=st.sidebar.number_input('DII net (₹ crore)',value=0.0,step=100.0)
-oi_bias=st.sidebar.selectbox('OI interpretation',['Not assessed','Bullish','Bearish','Mixed'])
+with st.sidebar.expander('Manual fallback (only if an automatic feed is unavailable)'):
+    use_manual_context=st.checkbox('Use manual PCR / FII-DII fallback',value=False)
+    manual_pcr=st.number_input('Fallback PCR',0.0,10.0,1.0,.05)
+    manual_fii=st.number_input('Fallback FII/FPI net (₹ crore)',value=0.0,step=100.0)
+    manual_dii=st.number_input('Fallback DII net (₹ crore)',value=0.0,step=100.0)
 news=st.sidebar.selectbox('Verified news bias',['Neutral/unknown','Positive','Negative','Mixed'])
 event=st.sidebar.selectbox('Government/geopolitical event risk',['Unknown/not checked','Low','Moderate','High'])
+
+# Automatic institutional flow is intentionally not fabricated: Angel One SmartAPI does not expose cash-market FII/DII net flows.
+# PCR uses Angel One's authenticated PCR endpoint when the user has connected SmartAPI.
+angel_api_for_pcr=st.session_state.get('angel_api')
+pcr_snapshot={"ok": False, "error": "Select Angel One API and connect to load automatic PCR."}
+if angel_api_for_pcr is not None:
+    pcr_snapshot=fetch_angel_pcr_snapshot(
+        getattr(angel_api_for_pcr, 'access_token', None),
+        getattr(angel_api_for_pcr, 'api_key', None),
+        st.session_state.get('angel_client_code',''), market)
+if pcr_snapshot.get('ok'):
+    pcr=float(pcr_snapshot['pcr'])
+    old_pcr=st.session_state.get('previous_auto_pcr')
+    pcr_delta=(pcr-float(old_pcr)) if old_pcr is not None else np.nan
+    st.session_state.previous_auto_pcr=pcr
+    pcr_source=pcr_snapshot.get('source','Angel One SmartAPI')
+    pcr_status='LIVE API' if data_source=='Angel One API' else 'Angel One connected'
+else:
+    pcr=float(manual_pcr) if use_manual_context else np.nan
+    pcr_delta=np.nan
+    pcr_source='Manual fallback' if use_manual_context else 'Unavailable'
+    pcr_status=pcr_snapshot.get('error','Unavailable')
+# SmartAPI PCR endpoint does not provide a prior-refresh OI-change series; do not invent it.
+call_oi=np.nan; put_oi=np.nan
+fii=float(manual_fii) if use_manual_context else np.nan
+dii=float(manual_dii) if use_manual_context else np.nan
+pcr_bias=('Bullish' if pcr>=1.15 else 'Bearish' if np.isfinite(pcr) and pcr<=0.80 else 'Mixed') if np.isfinite(pcr) else 'Not assessed'
+oi_bias='Not assessed'
 
 # Main data fetch
 if data_source=='Yahoo Finance':
@@ -423,12 +575,10 @@ if data.empty:
 data=indicators(data); last=data.iloc[-1]; price=safe(last.close)
 if not np.isfinite(price):st.error('Latest price unavailable.');st.stop()
 daily,levels=daily_info(ticker); pats=patterns(data); signal,bull,bear,reasons=get_signal(last)
-# Current signal only: apply manually supplied options/institutional/news context.
-# Historical backtest intentionally does not reuse today's manual context for past candles.
-if pcr_bias=='Bullish': bull+=1; reasons.append('Manual PCR context: bullish')
-elif pcr_bias=='Bearish': bear+=1; reasons.append('Manual PCR context: bearish')
-if oi_bias=='Bullish': bull+=1; reasons.append('Manual OI context: bullish')
-elif oi_bias=='Bearish': bear+=1; reasons.append('Manual OI context: bearish')
+# Current-bar context only. PCR is a soft confirmation, not a standalone trading signal.
+# FII/DII daily net flows are not part of Angel One SmartAPI, so unavailable values are not replaced with zero.
+if pcr_bias=='Bullish': bull+=1; reasons.append('Automatic PCR context: higher put/call ratio')
+elif pcr_bias=='Bearish': bear+=1; reasons.append('Automatic PCR context: lower put/call ratio')
 if news=='Positive': bull+=1; reasons.append('Manual news context: positive')
 elif news=='Negative': bear+=1; reasons.append('Manual news context: negative')
 if event=='High':
@@ -436,19 +586,33 @@ if event=='High':
 else:
     signal='BUY' if bull>=4 and bull>=bear+2 else 'SELL' if bear>=4 and bear>=bull+2 else 'WAIT'
 atr=safe(last.atr)
-if not np.isfinite(atr) or atr<=0:atr=price*.005
-entry=price; stop=price-atr_mult*atr if signal=='BUY' else price+atr_mult*atr if signal=='SELL' else np.nan; target=price+atr_mult*atr*rr if signal=='BUY' else price-atr_mult*atr*rr if signal=='SELL' else np.nan
+if not np.isfinite(atr) or atr<=0: atr=price*.005
+# Volatility-aware stop distance: ATR% sets the base multiplier, ADX slightly widens it in strong trends.
+atr_mult=adaptive_atr_multiplier(price,atr,last.adx)
+entry=price
+entry2=price-0.5*atr if signal=='BUY' else price+0.5*atr if signal=='SELL' else np.nan
+risk_distance=atr_mult*atr
+stop=price-risk_distance if signal=='BUY' else price+risk_distance if signal=='SELL' else np.nan
+target1=price+risk_distance if signal=='BUY' else price-risk_distance if signal=='SELL' else np.nan
+target2=price+risk_distance*rr if signal=='BUY' else price-risk_distance*rr if signal=='SELL' else np.nan
+target=target2
+confidence, conf_bull, conf_bear, conf_factor_count, conf_coverage, global_changes = combined_confidence(last,bull,bear,pcr,fii,dii,news,event,pats)
 
 st.subheader('1. Current Signal')
-c=st.columns(5); c[0].metric('Instrument',market);c[1].metric('Last Price',f'{price:,.2f}');c[2].metric('Signal',signal);c[3].metric('Bullish Score',bull);c[4].metric('Bearish Score',bear)
-st.caption(f'Source: {data_source} • Last candle: {data.index[-1]} • Score is rule alignment, not a calibrated winning probability.')
+c=st.columns(6); c[0].metric('Instrument',market);c[1].metric('Last Price',f'{price:,.2f}');c[2].metric('Signal',signal);c[3].metric('Bullish Score',bull);c[4].metric('Bearish Score',bear);c[5].metric('Multi-Factor Confidence',f'{confidence}%')
+st.caption(f'Source: {data_source} • Last candle: {data.index[-1]} • Confidence is a rule-based confluence index, not a calibrated probability of profit. Available-factor coverage: {conf_coverage}%.')
 st.write('Signal notes: '+' • '.join(reasons) if reasons else 'Signal notes: mixed/insufficient confirmation.')
 trend_now='Bullish' if last.ema20>last.ema50 else 'Bearish' if last.ema20<last.ema50 else 'Sideways'
-ctx=st.columns(6);ctx[0].metric('Trend',trend_now);ctx[1].metric('Volume ratio',fmt(last.vol_ratio));ctx[2].metric('PCR (manual)',f'{pcr:.2f}');ctx[3].metric('Call OI change',f'{call_oi:+.1f}%');ctx[4].metric('Put OI change',f'{put_oi:+.1f}%');ctx[5].metric('ADX',fmt(last.adx))
+ctx=st.columns(6);ctx[0].metric('Trend',trend_now);ctx[1].metric('Volume ratio',fmt(last.vol_ratio));ctx[2].metric('PCR (auto)',fmt(pcr));ctx[3].metric('PCR change',fmt(pcr_delta));ctx[4].metric('Auto ATR multiplier',f'{atr_mult:.2f}x');ctx[5].metric('ADX',fmt(last.adx))
 
-st.subheader('2. Entry, Exit, Target, Stop Loss & Trailing Stop')
-c=st.columns(5);c[0].metric('Entry',fmt(entry) if signal!='WAIT' else 'WAIT');c[1].metric('Stop Loss',fmt(stop));c[2].metric('Target',fmt(target));c[3].metric('ATR',fmt(atr));c[4].metric('Risk : Reward',f'1 : {rr:g}' if signal!='WAIT' else 'N/A')
-trail=price-atr_mult*atr if signal=='BUY' else price+atr_mult*atr if signal=='SELL' else np.nan;st.metric('Indicative Trailing Stop',fmt(trail));st.caption('Trailing stop is an indicative calculation; it is not sent to any broker.')
+st.subheader('2. Entry, Exit, Targets, Stop Loss & Trailing Stop')
+c=st.columns(7);c[0].metric('Entry 1',fmt(entry) if signal!='WAIT' else 'WAIT');c[1].metric('Entry 2 (ATR pullback)',fmt(entry2));c[2].metric('Stop Loss',fmt(stop));c[3].metric('Target 1 (1R)',fmt(target1));c[4].metric(f'Target 2 ({rr:g}R)',fmt(target2));c[5].metric('ATR',fmt(atr));c[6].metric('Risk : Reward',f'1 : {rr:g}' if signal!='WAIT' else 'N/A')
+trail=price-atr_mult*atr if signal=='BUY' else price+atr_mult*atr if signal=='SELL' else np.nan
+partial_exit_pct=st.select_slider('Suggested partial exit at Target 1 (%)',options=[25,33,50,75],value=50)
+st.metric('Indicative Trailing Stop',fmt(trail));st.caption(f'Paper/manual planning only: consider partial exit of {partial_exit_pct}% at Target 1. Entry 2 is an ATR pullback reference, not a guaranteed fill. No orders are sent to a broker.')
+with st.expander('Confidence factor details'):
+    st.write(f'Bullish directional factors: {conf_bull} • Bearish directional factors: {conf_bear} • Factors evaluated: {conf_factor_count} • Data coverage: {conf_coverage}%')
+    st.dataframe(pd.DataFrame([{'Factor':k,'Daily change %':v} for k,v in global_changes.items()]),use_container_width=True,hide_index=True)
 
 st.subheader('3. Price Chart & Indicators')
 st.caption('EMA, MACD and Bollinger Bands are included in the combined BUY/SELL/WAIT scoring, along with price action, RSI, ADX, VWAP, volume and candle patterns.')
@@ -479,16 +643,24 @@ if levels:
     c=st.columns(3);c[0].metric('ADR (14-day average range)',fmt(adr));c[1].metric('ADR %',fmt(adr_pct)+'%');c[2].metric('Previous Close',fmt(levels.get('Previous Close')))
 else:st.info('Daily levels unavailable.')
 
-st.subheader('7. PCR, OI Change, FII / DII and Event Context')
-st.info('Yahoo Finance does not reliably provide live NSE index PCR/OI changes or official FII/DII flows. Sidebar values are manually entered context, not verified live data.')
+st.subheader('7. Automatic PCR, FII / DII and Event Context')
+if pcr_snapshot.get('ok'):
+    st.success(f"PCR source: {pcr_source} • matched contract: {pcr_snapshot.get('symbol','N/A')} • updated: {pcr_snapshot.get('updated','N/A')}")
+else:
+    st.warning(f"Automatic PCR unavailable: {pcr_status}")
+if np.isfinite(fii) or np.isfinite(dii):
+    st.info('FII/DII values below are manual fallback inputs. They are not live values from Angel One.')
+else:
+    st.info('FII/FPI and DII cash-market net flows are not provided by the Angel One SmartAPI endpoint used here. To avoid fake values, the dashboard shows N/A until a licensed/authorized FII-DII data feed is connected.')
 c=st.columns(6)
-c[0].metric('PCR (manual)',f'{pcr:.2f}')
-c[1].metric('PCR change',f'{pcr_delta:+.2f}')
-c[2].metric('Call OI change',f'{call_oi:+.1f}%')
-c[3].metric('Put OI change',f'{put_oi:+.1f}%')
-c[4].metric('FII/FPI net',f'₹{fii:,.0f} cr')
-c[5].metric('DII net',f'₹{dii:,.0f} cr')
+c[0].metric('PCR',fmt(pcr))
+c[1].metric('PCR change since refresh',fmt(pcr_delta))
+c[2].metric('Call OI change',fmt(call_oi))
+c[3].metric('Put OI change',fmt(put_oi))
+c[4].metric('FII/FPI net (₹ cr)',fmt(fii,0))
+c[5].metric('DII net (₹ cr)',fmt(dii,0))
 st.write(f'PCR interpretation: {pcr_bias} • OI interpretation: {oi_bias} • Verified news bias: {news} • Government/geopolitical event risk: {event}')
+st.caption('PCR is an options-market context metric, not a guaranteed direction predictor. PCR change is measured against the previous successful app refresh; it is N/A on the first fetch or when the feed is unavailable.')
 
 st.subheader('8. Indian Major Stocks & Global Markets — Horizontal Performance Board')
 watch_groups={
@@ -587,10 +759,10 @@ macd_state='Bullish' if safe(last.macd)>safe(last.macd_signal) else 'Bearish' if
 bb_state='Above midline' if safe(last.close)>safe(last.bb_mid) else 'Below midline' if safe(last.close)<safe(last.bb_mid) else 'At midline'
 ema_state='Bullish' if safe(last.ema20)>safe(last.ema50) else 'Bearish' if safe(last.ema20)<safe(last.ema50) else 'Neutral'
 cc=st.columns(4);cc[0].metric('EMA20 / EMA50',ema_state);cc[1].metric('MACD Direction',macd_state);cc[2].metric('Bollinger Position',bb_state);cc[3].metric('Final Combined Signal',signal)
-st.caption('Final signal is a rule-based confluence of technical indicators plus the manually entered PCR/OI/news context. A BUY/SELL signal is not a guarantee; validate on historical data and paper trading.')
+st.caption('Final signal is a rule-based confluence of technical indicators plus automatic PCR context when available and user-entered news/event context. A BUY/SELL label is not a guarantee or a calibrated probability; use this as an educational/paper-trading dashboard.')
 
 st.subheader('12. Current Data / Signal Caveats')
-st.write('• Angel One mode automatically downloads the instrument master and resolves the selected instrument to its exchange and symbol token. You still need to authenticate with your own API Key, Client Code, Trading PIN and TOTP Secret. The global/sector performance board and MTF table currently use Yahoo Finance; PCR/OI, FII/DII, verified news, government announcements and geopolitical events remain manual context fields.')
+st.write('• Angel One mode resolves the instrument master and fetches candles. PCR is attempted through the authenticated SmartAPI endpoint. FII/DII net flows are manual fallback only in this build; live OI-change percentages and automatic news/geopolitical verification are not integrated and remain N/A/manual. Global daily changes use Yahoo Finance and may be delayed.')
 st.write('• “Win chance” is not inferred from score. The backtest win rate is historical for the selected ticker, period and rules and may not predict future results.')
 st.write('• Yahoo ticker coverage varies; some index symbols or intraday intervals may be unavailable. Always verify latest timestamps and use paper trading first.')
 st.caption('For public deployment, change the default login and use secure secrets. This app is not financial advice.')
