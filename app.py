@@ -31,8 +31,10 @@ def app_login():
 
     st.subheader("Application Login")
 
-    expected_user = os.getenv("APP_USERNAME", "admin")
-    expected_hash = os.getenv("APP_PASSWORD_SHA256", "")
+    expected_user = "admin"
+    expected_hash = hashlib.sha256(
+        "admin123".encode("utf-8")
+    ).hexdigest()
 
     with st.form("login_form"):
         username = st.text_input("Username")
