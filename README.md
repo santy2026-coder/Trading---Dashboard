@@ -1,46 +1,120 @@
-# Trading---Dashboard
-Trading Anlysis
-# Advanced Trading Dashboard
+# Trading Intelligence Terminal
 
-Streamlit dashboard based on the supplied `app.py`, expanded to cover the consolidated trading-dashboard requirements.
+A Python and Streamlit starter application for market analysis,
+technical indicators, signal scoring, risk/reward calculations,
+basic backtesting, and trade journaling.
 
-## Included
-- Login: `admin` / `admin123` (demo/local credentials)
-- Demo password recovery with recovery PIN `1234` (override with `TRADING_RECOVERY_PIN`)
-- Live/paper-analysis workflow
-- Auto refresh enable/disable and interval
-- Market status / IST clock
-- NIFTY, BANK NIFTY, SENSEX, sector indices, NSE stocks, crypto and custom Yahoo symbols
-- EMA 5/21/50/200, RSI, MACD, VWAP, ATR, ADX, Bollinger Bands, Stochastic, CCI, pivot/support/resistance and Fibonacci
-- Candlestick and approximate chart-pattern detection
-- Multi-factor BUY/SELL/WAIT signal and critical analysis
-- Entry, Target 1/2/3, stop loss, break-even and trailing stop
-- ATM/nearby OTM option suggestions when a Yahoo option chain is available
-- PCR/OI/volume option-chain analysis when available
-- Paper positions with live P/L and optional automatic target/trailing-SL exit
-- Risk-based position sizing and max position value
-- Historical backtest with signal stats and drawdown/return metrics
-- Advance/Decline dashboard
-- USD/INR, crude, gold and global/market context
-- Live market/news/geopolitical headline context with transparent keyword biasing
-- NSE FII/DII feed when the official endpoint is reachable
-- Pre-open snapshot attempt and clearly labelled fallback estimate
-- Broker integration placeholders; no real order is placed by default
+## Features
 
-## Install
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+- Application login gate
+- Instrument selection
+- NIFTY, BANK NIFTY, SENSEX and stock symbol input
+- Manual Angel One API login form
+- Historical candle retrieval through SmartAPI
+- Demo data mode for testing the interface
+- EMA 20 and EMA 50
+- RSI
+- ATR
+- VWAP
+- Rule-based BUY, SELL and WAIT signals
+- Risk/reward calculator
+- Basic EMA crossover backtest
+- Trade journal and CSV export
 
-### Android / Termux
-```bash
-pip install -r requirements.txt
-python run_android.py
-```
-Then open the Streamlit URL shown by the terminal, normally port `8501`.
+## Requirements
 
-## Important
-Yahoo/NSE endpoints can be delayed, rate-limited, blocked, or incomplete. FII/DII, options, news and live prices are displayed only when the source responds. The app does not fabricate missing market data.
+- Python 3.10 or newer
+- Angel One SmartAPI account for broker-data testing
+- Valid API key and broker login credentials
+- Correct exchange and symbol token
 
-Paper trading is simulation only. Real broker execution requires the broker's current official API, secure credentials, explicit order controls and additional production safeguards.
+## Installation
+
+Open a terminal in the project directory.
+
+Install dependencies:
+
+    pip install -r requirements.txt
+
+## Configure Application Login
+
+Set the environment variable APP_USERNAME.
+
+Generate a SHA-256 password hash by running:
+
+    python -c "import hashlib; print(hashlib.sha256(b'YOUR-STRONG-PASSWORD').hexdigest())"
+
+Set the resulting hash as APP_PASSWORD_SHA256.
+
+Example for macOS/Linux:
+
+    export APP_USERNAME="admin"
+    export APP_PASSWORD_SHA256="PASTE_HASH_HERE"
+
+On Windows PowerShell:
+
+    $env:APP_USERNAME="admin"
+    $env:APP_PASSWORD_SHA256="PASTE_HASH_HERE"
+
+Use your own username and password. Do not commit credentials to source control.
+
+## Start the Application
+
+Run:
+
+    streamlit run app.py
+
+Streamlit will print a local address in the terminal. Open that address
+in your browser.
+
+## Demo Mode
+
+Choose Demo Data in the sidebar and click Fetch / Refresh Market Data.
+
+Demo prices are synthetic. They are not actual exchange prices.
+
+## Manual Angel One Connection
+
+1. Choose Angel One API in the Data Source selector.
+2. Enter your API key, client code, trading PIN, and TOTP secret.
+3. Enter the correct exchange and symbol token.
+4. Click Connect to Angel One.
+5. Click Fetch / Refresh Market Data.
+
+The broker's API and SDK behavior may change. Verify the integration against
+the current official Angel One SmartAPI documentation.
+
+Never share API keys, PINs, OTPs, TOTP secrets, or session tokens.
+Do not expose a credential-entry application publicly.
+
+## Important Limitations
+
+This is a starter project, not a production-ready trading system.
+
+The current implementation does not include:
+
+- WebSocket real-time tick streaming
+- Guaranteed zero-delay market data
+- Option-chain analysis
+- PCR and open-interest analysis
+- FII/DII data integration
+- Global market feeds
+- News and sentiment analysis
+- Production-grade authentication
+- Live order placement or automated trading
+- Calibrated signal win probabilities
+
+The backtest is illustrative and excludes brokerage, taxes, slippage,
+partial fills, latency, and other real execution costs.
+
+A signal score is not a probability of winning. Evaluate strategies on
+historical data and out-of-sample periods, include all costs, and test
+using paper trading before considering any live trading workflow.
+
+## Security
+
+- Keep credentials out of source files and Git repositories.
+- Prefer environment variables or a secure secrets manager.
+- Use a trusted local environment while testing.
+- Rotate credentials if they may have been exposed.
+- Do not rely on this starter's login gate as production security.
