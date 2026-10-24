@@ -715,3 +715,21 @@ if st.session_state["journal"]:
     )
 
     completed = journal_df[
+        journal_df["Outcome"].isin(["Win", "Loss"])
+    ]
+
+    if not completed.empty:
+        wins = (completed["Outcome"] == "Win").sum()
+        losses = (completed["Outcome"] == "Loss").sum()
+        total = len(completed)
+
+        win_rate = (wins / total) * 100
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric("Completed Trades", total)
+        c2.metric("Wins", int(wins))
+        c3.metric("Win Rate", f"{win_rate:.2f}%")
+
+    else:
+        st.info("Win rate dekhne ke liye pehle trades ka outcome record karo.")
