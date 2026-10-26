@@ -5,5 +5,7 @@ pandas>=2.0.0
 numpy>=1.24.0
 requests>=2.31.0
 plotly>=5.20.0
-smartapi-python>=1.4.8
-pyotp>=2.9.0
+smartapi-python
+pyotp
+logzero
+websocket-client
