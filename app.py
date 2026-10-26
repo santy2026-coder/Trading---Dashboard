@@ -584,13 +584,22 @@ def get_option_chain_snapshot(index_name, spot_price, max_strikes=12):
         fetched = payload.get("fetched") or []
         if not fetched:
             return pd.DataFrame(), f"Angel One returned no option quotes: {(response or {}).get('message', '')}"
-        quote_by_token = {str(q.get("symbolToken", q.get("token", ""))): q for q in fetched}
+        # SmartAPI quote payload key casing can vary; normalize tokens and quote keys.
+        quote_by_token = {}
+        for q in fetched:
+            if not isinstance(q, dict):
+                continue
+            qnorm = {str(k).strip().lower(): v for k, v in q.items()}
+            qtoken = qnorm.get("symboltoken", qnorm.get("token", qnorm.get("symbol_token", "")))
+            if qtoken is not None and str(qtoken).strip():
+                quote_by_token[str(qtoken).strip()] = qnorm
         records = []
         for _, row in frame.iterrows():
-            token = str(row[token_col])
+            token = str(row[token_col]).strip()
             q = quote_by_token.get(token, {})
-            oi = q.get("opnInterest", q.get("openInterest", q.get("open_interest", np.nan)))
-            ltp = q.get("ltp", np.nan)
+            # Angel One commonly returns `opnInterest`; accept documented/common aliases too.
+            oi = q.get("opninterest", q.get("openinterest", q.get("open_interest", q.get("oi", np.nan))))
+            ltp = q.get("ltp", q.get("lasttradedprice", np.nan))
             records.append({
                 "Expiry": str(row["_expiry"].date()),
                 "Strike": float(row["_strike"]),
@@ -653,7 +662,7 @@ def render_option_panel(index_name, spot_price):
     c2.metric("PCR (displayed strikes)", f"{pcr:.2f}" if pd.notna(pcr) else "N/A")
     c3.metric("Net OI change (PE−CE)", f"{oi_diff:,.0f}" if pd.notna(oi_diff) else "N/A")
     c4.metric("Option signal", option_signal)
-    st.caption(note + f" Selected view: {interval_label}. OI change is polling-based; the selected interval does not create historical broker snapshots that were never captured.")
+    st.caption(note + f" Selected view: {interval_label}. Change in OI is calculated from consecutive successful Angel One snapshots. The first snapshot is the baseline (N/A); the next successful refresh calculates the difference. This is not broker-provided historical OI for the selected timeframe.")
     view = chain[["Strike", "Type", "LTP", "OI", "Change in OI"]].copy()
     view["LTP"] = view["LTP"].map(lambda x: round(x, 2) if pd.notna(x) else np.nan)
     st.dataframe(view, use_container_width=True, hide_index=True)
@@ -725,8 +734,8 @@ with st.sidebar:
     yahoo_interval = {"1 minute": "1m", "3 minutes": "5m", "5 minutes": "5m", "15 minutes": "15m", "Daily": "1d"}[interval_label]
     angel_interval = {"1 minute": "ONE_MINUTE", "3 minutes": "THREE_MINUTE", "5 minutes": "FIVE_MINUTE", "15 minutes": "FIFTEEN_MINUTE", "Daily": "ONE_DAY"}[interval_label]
     rr_multiple = st.selectbox("Risk : Reward target (T1)", [1, 2, 3, 5], index=1, format_func=lambda x: f"1:{x}")
-    refresh_enabled = st.toggle("Auto-refresh", value=False)
-    refresh_seconds = st.selectbox("Refresh interval", [5, 10, 15, 30, 60], index=2)
+    refresh_enabled = st.toggle("Auto-refresh", value=True, help="Keeps live quote snapshots updating so Change in OI can compare the latest snapshot with the previous one.")
+    refresh_seconds = st.selectbox("Refresh interval", [10, 15, 30, 60], index=2)
     st.session_state.refresh_on = refresh_enabled
     if refresh_enabled:
         st_autorefresh(interval=refresh_seconds * 1000, key="market_refresh")
@@ -782,10 +791,17 @@ if data.empty:
     st.stop()
 
 d = add_indicators(data)
-# Fetch/calculate multi-timeframe context before scoring. If unavailable, it is excluded.
+# Fetch/calculate multi-timeframe context from the selected live data source.
+# When Angel One is active, request each timeframe from Angel One (not Yahoo).
 mtf_votes = []
-for _tf, _period in [("5m", "5d"), ("15m", "5d")]:
-    _mtf_df = get_yahoo_history(symbol, period=_period, interval=_tf)
+_mtf_source_is_angel = source == "Angel One" and actual_source != "Yahoo fallback"
+_mtf_fetch_plan = [("5m", "FIVE_MINUTE", "5d"), ("15m", "FIFTEEN_MINUTE", "5d")]
+for _label, _angel_tf, _period in _mtf_fetch_plan:
+    if _mtf_source_is_angel:
+        _mtf_df, _mtf_note = get_angel_history(symbol, _angel_tf)
+    else:
+        _mtf_interval = {"FIVE_MINUTE": "5m", "FIFTEEN_MINUTE": "15m"}[_angel_tf]
+        _mtf_df = get_yahoo_history(symbol, period=_period, interval=_mtf_interval)
     if not _mtf_df.empty and len(_mtf_df) >= 25:
         _fast = _mtf_df["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
         _slow = _mtf_df["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
@@ -794,6 +810,80 @@ st.session_state.mtf_bias = "Bullish" if len(mtf_votes) >= 2 and sum(mtf_votes) 
 signal = analyze_signal(d, rr_multiple)
 last = d.iloc[-1]
 st.caption(f"Selected: **{symbol_label}** · Data source: **{actual_source}** · Last candle: {d.index[-1]}")
+
+# Dashboard overview styled to match the user's reference screenshots.
+# These are display-only metrics; confidence is an indicator score, not a guaranteed win probability.
+bt_preview = calc_backtest(d)
+_bt_returns = bt_preview["strategy_return"].dropna() if not bt_preview.empty else pd.Series(dtype=float)
+_bt_wins = int((_bt_returns > 0).sum())
+_bt_losses = int((_bt_returns < 0).sum())
+_bt_total = len(_bt_returns)
+_bt_win_rate = (_bt_wins / _bt_total * 100) if _bt_total else np.nan
+
+def _metric_value(row, col, fmt="{:.2f}"):
+    try:
+        value = row.get(col, np.nan)
+        return fmt.format(float(value)) if pd.notna(value) else "N/A"
+    except Exception:
+        return "N/A"
+
+st.subheader("📊 Trading Dashboard Overview")
+summary1 = st.columns(7)
+summary1[0].metric("Current Price", f"{float(last['Close']):,.2f}")
+summary1[1].metric("EMA20", _metric_value(last, "EMA20"))
+summary1[2].metric("RSI", _metric_value(last, "RSI", "{:.1f}"))
+summary1[3].metric("MACD", _metric_value(last, "MACD"))
+summary1[4].metric("Backtest Win Rate", f"{_bt_win_rate:.1f}%" if np.isfinite(_bt_win_rate) else "N/A")
+summary1[5].metric("Bullish Score", signal.get("bullish_score", 0))
+summary1[6].metric("Signal Quality", signal.get("signal", "WAIT"))
+summary2 = st.columns(7)
+summary2[0].metric("VWAP", _metric_value(last, "VWAP"))
+summary2[1].metric("EMA50", _metric_value(last, "EMA50"))
+summary2[2].metric("ATR", _metric_value(last, "ATR"))
+summary2[3].metric("ADX", _metric_value(last, "ADX"))
+summary2[4].metric("Rule Confidence", f"{signal.get('confidence', 0)}%")
+summary2[5].metric("Bearish Score", signal.get("bearish_score", 0))
+summary2[6].metric("MTF Status", st.session_state.get("mtf_bias", "N/A"))
+summary3 = st.columns(5)
+summary3[0].metric("Support", _metric_value(last, "Support"))
+summary3[1].metric("Resistance", _metric_value(last, "Resistance"))
+summary3[2].metric("Backtest Positive Bars", _bt_wins if _bt_total else "N/A")
+summary3[3].metric("Backtest Negative Bars", _bt_losses if _bt_total else "N/A")
+summary3[4].metric("Risk : Reward", signal.get("rr", "N/A"))
+st.caption("Backtest bar counts are proxy results, not a promise of future performance. Rule confidence is not the same as win probability.")
+
+st.subheader("📊 Multi Timeframe Alignment")
+_mtf_rows = []
+_mtf_display_plan = [
+    ("1m", "ONE_MINUTE", "1m", "1d"),
+    ("3m", "THREE_MINUTE", "5m", "5d"),
+    ("5m", "FIVE_MINUTE", "5m", "5d"),
+    ("15m", "FIFTEEN_MINUTE", "15m", "5d"),
+]
+for _label, _angel_tf, _yahoo_interval, _period in _mtf_display_plan:
+    if source == "Angel One" and actual_source != "Yahoo fallback":
+        _frame, _mtf_note = get_angel_history(symbol, _angel_tf)
+    else:
+        _frame = get_yahoo_history(symbol, period=_period, interval=_yahoo_interval)
+    if not _frame.empty and len(_frame) >= 20:
+        _f = _frame["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
+        _sl = _frame["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
+        _trend = "Bullish" if _f > _sl else "Bearish" if _f < _sl else "Neutral"
+        _close = float(_frame["Close"].iloc[-1])
+    else:
+        _trend, _close = "N/A", np.nan
+    _mtf_rows.append({"Timeframe": _label, "Trend": _trend, "Latest Close": f"{_close:,.2f}" if np.isfinite(_close) else "N/A"})
+_mtf_table = pd.DataFrame(_mtf_rows)
+st.dataframe(_mtf_table, use_container_width=True, hide_index=True)
+_bull_tf = sum(r["Trend"] == "Bullish" for r in _mtf_rows)
+_bear_tf = sum(r["Trend"] == "Bearish" for r in _mtf_rows)
+_mtf_status = "Strong Bullish Alignment" if _bull_tf >= 3 else "Strong Bearish Alignment" if _bear_tf >= 3 else "Mixed / Partial Alignment"
+if _bull_tf >= 3:
+    st.success(f"🔥 {_mtf_status} · Bullish TF: {_bull_tf} · Bearish TF: {_bear_tf}")
+elif _bear_tf >= 3:
+    st.error(f"🧊 {_mtf_status} · Bullish TF: {_bull_tf} · Bearish TF: {_bear_tf}")
+else:
+    st.info(f"ℹ️ {_mtf_status} · Bullish TF: {_bull_tf} · Bearish TF: {_bear_tf}")
 
 # Global / Indian market snapshot
 with st.expander("🌍 Global markets and macro instruments", expanded=True):
@@ -914,7 +1004,7 @@ for col, (label, interval, period) in zip(mtf_cols, [("1-minute", "1m", "1d"), (
             st.metric(label, "N/A", "Data unavailable")
 
 st.subheader("📊 Backtest (EMA 9/20 crossover proxy, full bar series)")
-bt = calc_backtest(d)
+bt = bt_preview
 if bt.empty:
     st.info("Not enough historical candles for this backtest.")
 else:
