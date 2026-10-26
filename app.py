@@ -607,8 +607,12 @@ def get_option_chain_snapshot(index_name, spot_price, max_strikes=12):
         cache_key = f"oi_{index_name}"
         history = st.session_state.get(cache_key, [])
         previous = history[-1]["quotes"] if history else {}
+        # First successful snapshot has no baseline: report N/A, not a misleading zero.
+        # From the second snapshot onward, compare only tokens present in the previous snapshot.
         result["Change in OI"] = result.apply(
-            lambda r: r["OI"] - previous.get(r["Token"], r["OI"]) if pd.notna(r["OI"]) else np.nan, axis=1
+            lambda r: (r["OI"] - previous[r["Token"]])
+            if pd.notna(r["OI"]) and r["Token"] in previous else np.nan,
+            axis=1,
         )
         quote_map = {r["Token"]: r["OI"] for _, r in result.iterrows() if pd.notna(r["OI"])}
         history.append({"time": now, "quotes": quote_map})
