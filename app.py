@@ -1,768 +1,919 @@
-import os, hashlib, time, requests
-from datetime import datetime
+import json
+import time
+import os
+import hashlib
+from datetime import datetime, timedelta
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
+from streamlit_autorefresh import st_autorefresh
+
+# Optional broker dependencies: Yahoo/demo mode can still run if SmartAPI is not installed.
 try:
-    from streamlit_autorefresh import st_autorefresh
-except ImportError:
-    st_autorefresh = None
+    from SmartApi import SmartConnect
+    import pyotp
+    SMARTAPI_AVAILABLE = True
+except Exception:
+    SmartConnect = None
+    pyotp = None
+    SMARTAPI_AVAILABLE = False
 
-st.set_page_config(page_title='Trading Intelligence Terminal', page_icon='📈', layout='wide')
+st.set_page_config(page_title="Trading Intelligence Terminal", page_icon="📈", layout="wide")
 
-def sha256(s): return hashlib.sha256(s.encode('utf-8')).hexdigest()
-def login():
-    if st.session_state.get('authenticated'): return True
-    st.title('🔐 Trading Intelligence Terminal')
-    st.subheader('Application Login')
-    user_expected = os.getenv('APP_USERNAME', 'admin')
-    hash_expected = os.getenv('APP_PASSWORD_SHA256', sha256('admin123'))
-    with st.form('login_form'):
-        user = st.text_input('Username')
-        password = st.text_input('Password', type='password')
-        submit = st.form_submit_button('Login')
-    if submit:
-        if user == user_expected and sha256(password) == hash_expected:
-            st.session_state.authenticated = True
-            st.rerun()
-        else: st.error('Username or password is incorrect.')
-    st.caption('Testing default: admin / admin123. Change before public deployment.')
-    return False
-if not login(): st.stop()
+APP_DIR = Path(__file__).parent
+JOURNAL_PATH = APP_DIR / "trade_journal.csv"
+INSTRUMENT_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
-st.title('📈 Trading Intelligence Terminal')
-st.caption('Technical analysis • Global markets • PCR/OI context • Backtesting • Paper trading')
-st.warning('Research and paper-trading tool only. Yahoo Finance data may be delayed or incomplete. No live broker orders are placed. Scores are not guaranteed win probabilities.')
-
-for k,v in {'paper_trades': [], 'paper_position': None, 'angel_candles': None}.items():
-    if k not in st.session_state: st.session_state[k] = v
-
-SYMBOLS = {
- 'NIFTY 50':'^NSEI','BANK NIFTY':'^NSEBANK','SENSEX':'^BSESN','NIFTY IT':'^CNXIT','NIFTY AUTO':'^CNXAUTO',
- 'RELIANCE':'RELIANCE.NS','HDFC BANK':'HDFCBANK.NS','ICICI BANK':'ICICIBANK.NS','SBI':'SBIN.NS','AXIS BANK':'AXISBANK.NS','KOTAK BANK':'KOTAKBANK.NS',
- 'TCS':'TCS.NS','INFOSYS':'INFY.NS','HCLTECH':'HCLTECH.NS','WIPRO':'WIPRO.NS','TECH MAHINDRA':'TECHM.NS',
- 'MARUTI':'MARUTI.NS','M&M':'M&M.NS','TATA MOTORS':'TMPV.NS','BAJAJ AUTO':'BAJAJ-AUTO.NS','EICHER MOTORS':'EICHERMOT.NS','RELIANCE ENERGY CONTEXT':'RELIANCE.NS'
+INDIAN_WATCHLIST = {
+    "NIFTY 50": "^NSEI", "BANK NIFTY": "^NSEBANK", "SENSEX": "^BSESN",
+    "Reliance": "RELIANCE.NS", "HDFC Bank": "HDFCBANK.NS", "ICICI Bank": "ICICIBANK.NS",
+    "SBI": "SBIN.NS", "Axis Bank": "AXISBANK.NS", "Kotak Bank": "KOTAKBANK.NS",
+    "TCS": "TCS.NS", "Infosys": "INFY.NS", "HCL Tech": "HCLTECH.NS",
+    "Wipro": "WIPRO.NS", "Tech Mahindra": "TECHM.NS",
+    "Tata Motors": "TATAMOTORS.NS", "Maruti": "MARUTI.NS", "Mahindra & Mahindra": "M&M.NS",
+    "Bajaj Auto": "BAJAJ-AUTO.NS", "Hero MotoCorp": "HEROMOTOCO.NS",
+    "ITC": "ITC.NS", "Larsen & Toubro": "LT.NS", "Bharti Airtel": "BHARTIARTL.NS",
 }
-GLOBAL = {'US S&P 500':'^GSPC','US Nasdaq':'^IXIC','US Dow Jones':'^DJI','Japan Nikkei':'^N225','Hong Kong Hang Seng':'^HSI','China Shanghai':'000001.SS','South Korea KOSPI':'^KS11','Brent Crude':'BZ=F','USD/INR':'INR=X','India VIX':'^INDIAVIX'}
-
-ANGEL_MASTER_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
-ANGEL_PCR_URL = "https://apiconnect.angelone.in/rest/secure/angelbroking/marketData/v1/putCallRatio"
-
-# PCR is fetched from the authenticated Angel One SmartAPI (not scraped from NSE).
-PCR_ALIASES = {
-    "NIFTY 50": ("NIFTY",), "BANK NIFTY": ("BANKNIFTY", "NIFTYBANK"),
-    "NIFTY IT": ("CNXIT", "NIFTYIT"), "NIFTY AUTO": ("CNXAUTO", "NIFTYAUTO"),
-    "RELIANCE": ("RELIANCE",), "HDFC BANK": ("HDFCBANK",), "ICICI BANK": ("ICICIBANK",),
-    "SBI": ("SBIN",), "AXIS BANK": ("AXISBANK",), "KOTAK BANK": ("KOTAKBANK",),
-    "TCS": ("TCS",), "INFOSYS": ("INFY", "INFOSYS"), "HCLTECH": ("HCLTECH",),
-    "WIPRO": ("WIPRO",), "TECH MAHINDRA": ("TECHM",), "MARUTI": ("MARUTI",),
-    "M&M": ("M&M", "MM"), "TATA MOTORS": ("TATAMOTORS", "TMPV"),
-    "BAJAJ AUTO": ("BAJAJ-AUTO", "BAJAJAUTO"), "EICHER MOTORS": ("EICHERMOT",),
+GLOBAL_WATCHLIST = {
+    "S&P 500": "^GSPC", "NASDAQ": "^IXIC", "Dow Jones": "^DJI",
+    "Nikkei 225": "^N225", "Hang Seng": "^HSI", "Shanghai Composite": "000001.SS",
+    "FTSE 100": "^FTSE", "DAX": "^GDAXI", "Gift Nifty (Yahoo symbol may vary)": "NIFTY=F",
+    "USD/INR": "INR=X", "Brent Crude": "BZ=F", "Gold": "GC=F", "India VIX": "^INDIAVIX",
 }
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_angel_pcr_snapshot(jwt_token, api_key, client_code, market_name):
-    """Fetch cumulative options PCR from Angel One's authenticated SmartAPI."""
-    if not jwt_token or not api_key:
-        return {"ok": False, "error": "Connect Angel One to load automatic PCR."}
+def init_state():
+    defaults = {
+        "angel_api": "", "angel_client": "", "angel_pin": "", "angel_totp": "",
+        "angel_session": None, "angel_instruments": None, "angel_status": "Not connected",
+        "paper_position": None, "paper_cash": 100000.0, "paper_realized": 0.0,
+        "last_data": None, "source": "Yahoo Finance", "refresh_on": False,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+init_state()
+
+# Basic app gate. Configure APP_USERNAME and APP_PASSWORD in deployment secrets/env.
+# Defaults are for first-run convenience only and MUST be changed before sharing publicly.
+def _configured_secret(name, default):
     try:
-        public_ip = "127.0.0.1"
-        try:
-            public_ip = requests.get("https://api.ipify.org", timeout=3).text.strip() or public_ip
-        except Exception:
-            pass
-        headers = {
-            "Authorization": "Bearer " + str(jwt_token).replace("Bearer ", ""),
-            "Content-Type": "application/json", "Accept": "application/json",
-            "X-UserType": "USER", "X-SourceID": "WEB",
-            "X-ClientLocalIP": "127.0.0.1", "X-ClientPublicIP": public_ip,
-            "X-MACAddress": "00:00:00:00:00:00", "X-PrivateKey": str(api_key),
-        }
-        response = requests.get(ANGEL_PCR_URL, headers=headers, timeout=12)
-        response.raise_for_status()
-        payload = response.json()
-        if not payload.get("status"):
-            return {"ok": False, "error": str(payload.get("message") or payload.get("errorcode") or "Angel One PCR request failed")}
-        rows = payload.get("data") or []
-        aliases = PCR_ALIASES.get(market_name)
-        if market_name == "Custom Yahoo ticker":
-            aliases = ()
-        if not aliases:
-            return {"ok": False, "error": "Automatic PCR mapping is not available for this instrument."}
-        matched = []
-        for row in rows:
-            tsym = str(row.get("tradingSymbol", "")).upper()
-            # PCR API maps option PCR to the underlying futures trading symbol.
-            if any(tsym.startswith(a.upper()) for a in aliases):
-                try:
-                    val = float(row.get("pcr"))
-                    if np.isfinite(val) and val > 0:
-                        matched.append({"pcr": val, "symbol": tsym})
-                except Exception:
-                    pass
-        if not matched:
-            return {"ok": False, "error": "Angel One returned no PCR row for the selected underlying."}
-        # Prefer the first exact underlying match from the API's response list.
-        return {"ok": True, **matched[0], "source": "Angel One SmartAPI", "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-    except Exception as exc:
-        return {"ok": False, "error": f"Angel One PCR feed unavailable: {exc}"}
+        value = st.secrets.get(name, None)
+        if value is not None and str(value).strip():
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(name, default)
 
+APP_USERNAME = _configured_secret("APP_USERNAME", "admin")
+APP_PASSWORD = _configured_secret("APP_PASSWORD", "admin123")
+
+def require_login():
+    if st.session_state.get("authenticated", False):
+        with st.sidebar:
+            st.caption("Login: authenticated")
+            if st.button("Log out", use_container_width=True):
+                st.session_state["authenticated"] = False
+                st.rerun()
+        return
+    st.title("🔐 Trading Intelligence Terminal — Login")
+    st.caption("Set APP_USERNAME and APP_PASSWORD in Streamlit secrets/environment before public deployment.")
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login", use_container_width=True)
+    if submitted:
+        if username == APP_USERNAME and hashlib.sha256(password.encode()).hexdigest() == hashlib.sha256(APP_PASSWORD.encode()).hexdigest():
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect username or password.")
+    st.stop()
+
+require_login()
+
+def safe_float(value, default=np.nan):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+def get_yahoo_history(symbol, period="5d", interval="5m"):
+    try:
+        data = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False, threads=False)
+        if data is None or data.empty:
+            return pd.DataFrame()
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        data = data.rename(columns={c: str(c).title() for c in data.columns})
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        if not all(c in data.columns for c in required):
+            return pd.DataFrame()
+        data = data[required].dropna(subset=["Open", "High", "Low", "Close"])
+        data.index = pd.to_datetime(data.index)
+        return data
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_angel_master():
-    """Download Angel One's public instrument master and cache it for one hour."""
-    response = requests.get(ANGEL_MASTER_URL, timeout=25)
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, list) or not payload:
-        raise RuntimeError("Angel One instrument master returned an unexpected format.")
-    frame = pd.DataFrame(payload)
-    required = {"symbol", "token", "exch_seg"}
-    if not required.issubset(frame.columns):
-        raise RuntimeError("Instrument master is missing symbol/token/exchange fields.")
-    for col in ("symbol", "name", "exch_seg", "instrumenttype", "token"):
-        if col not in frame.columns: frame[col] = ""
-        frame[col] = frame[col].fillna("").astype(str)
-    frame["_sym_norm"] = frame["symbol"].str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
-    frame["_name_norm"] = frame["name"].str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
-    frame["_exchange_norm"] = frame["exch_seg"].str.upper()
-    return frame
+def download_instrument_master():
+    try:
+        response = requests.get(INSTRUMENT_URL, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+        return pd.DataFrame(payload)
+    except Exception:
+        return pd.DataFrame()
 
-ANGEL_ALIASES = {
-    "NIFTY 50": ["NIFTY 50", "NIFTY50"],
-    "BANK NIFTY": ["NIFTY BANK", "BANKNIFTY", "NIFTYBANK"],
-    "SENSEX": ["SENSEX"],
-    "NIFTY IT": ["NIFTY IT", "NIFTYIT"],
-    "NIFTY AUTO": ["NIFTY AUTO", "NIFTYAUTO"],
-    "RELIANCE": ["RELIANCE-EQ", "RELIANCE"],
-    "HDFC BANK": ["HDFCBANK-EQ", "HDFCBANK"],
-    "ICICI BANK": ["ICICIBANK-EQ", "ICICIBANK"],
-    "SBI": ["SBIN-EQ", "SBIN"],
-    "AXIS BANK": ["AXISBANK-EQ", "AXISBANK"],
-    "KOTAK BANK": ["KOTAKBANK-EQ", "KOTAKBANK"],
-    "TCS": ["TCS-EQ", "TCS"],
-    "INFOSYS": ["INFY-EQ", "INFY"],
-    "HCLTECH": ["HCLTECH-EQ", "HCLTECH"],
-    "WIPRO": ["WIPRO-EQ", "WIPRO"],
-    "TECH MAHINDRA": ["TECHM-EQ", "TECHM"],
-    "MARUTI": ["MARUTI-EQ", "MARUTI"],
-    "M&M": ["M&M-EQ", "MM-EQ", "M&M"],
-    "TATA MOTORS": ["TMPV-EQ", "TATAMOTORS-EQ", "TMPV", "TATAMOTORS"],
-    "BAJAJ AUTO": ["BAJAJ-AUTO-EQ", "BAJAJAUTO-EQ", "BAJAJ-AUTO"],
-    "EICHER MOTORS": ["EICHERMOT-EQ", "EICHERMOT"],
-}
+def connect_angel():
+    if not SMARTAPI_AVAILABLE:
+        raise RuntimeError("SmartAPI/pyotp package is unavailable. Install requirements.txt and redeploy.")
+    api_key = st.session_state.angel_api.strip()
+    client_code = st.session_state.angel_client.strip()
+    pin = st.session_state.angel_pin.strip()
+    totp_secret = st.session_state.angel_totp.strip()
+    if not all([api_key, client_code, pin, totp_secret]):
+        raise ValueError("Enter Angel One API Key, Client Code, PIN and TOTP secret.")
+    otp = pyotp.TOTP(totp_secret).now()
+    client = SmartConnect(api_key=api_key)
+    result = client.generateSession(client_code, pin, otp)
+    if not result or not result.get("status"):
+        raise RuntimeError(f"Angel One login failed: {(result or {}).get('message', 'Unknown error')}")
+    st.session_state.angel_session = client
+    st.session_state.angel_status = "Connected"
+    return result
 
-def resolve_angel_instrument(master, display_name, custom_query=""):
-    """Resolve a selected display name to its exchange, trading symbol and token."""
-    if master is None or master.empty: raise RuntimeError("Angel One instrument master is empty.")
-    if display_name == "Custom Yahoo ticker":
-        query = custom_query.strip().upper()
-        if not query: raise RuntimeError("Enter an instrument name/symbol to search; token is resolved automatically.")
-        candidates = [query, query + "-EQ"]
-        preferred_exchange = "NSE"
-    else:
-        candidates = ANGEL_ALIASES.get(display_name, [display_name])
-        preferred_exchange = "BSE" if display_name == "SENSEX" else "NSE"
-    norm_candidates = ["".join(ch for ch in c.upper() if ch.isalnum()) for c in candidates]
-    subset = master[master["_exchange_norm"].isin([preferred_exchange, "BSE" if preferred_exchange == "NSE" else "NSE"])].copy()
-    # Exact symbol match first; stock entries are preferred over derivative contracts.
-    for candidate in norm_candidates:
-        hits = subset[subset["_sym_norm"] == candidate]
-        if not hits.empty:
-            hits = hits.copy()
-            hits["_exchange_rank"] = (hits["_exchange_norm"] != preferred_exchange).astype(int)
-            hits["_derivative_rank"] = hits["_sym_norm"].str.contains(r"FUT|CE|PE", regex=True).astype(int)
-            hits = hits.sort_values(["_exchange_rank", "_derivative_rank"])
-            row = hits.iloc[0]
-            return {"exchange": row["exch_seg"].upper(), "symbol": row["symbol"], "token": row["token"], "name": row["name"] or row["symbol"]}
-    # Index symbols sometimes use the display name in the master instead of the symbol field.
-    for candidate in norm_candidates:
-        hits = subset[(subset["_name_norm"] == candidate) | (subset["_sym_norm"] == candidate)]
-        if not hits.empty:
-            hits = hits.copy(); hits["_exchange_rank"] = (hits["_exchange_norm"] != preferred_exchange).astype(int)
-            row = hits.sort_values("_exchange_rank").iloc[0]
-            return {"exchange": row["exch_seg"].upper(), "symbol": row["symbol"], "token": row["token"], "name": row["name"] or row["symbol"]}
-    raise RuntimeError(f"'{display_name if display_name != 'Custom Yahoo ticker' else custom_query}' was not found in Angel One's instrument master. Try another listed instrument or refresh the master.")
+def find_angel_token(symbol, exchange="NSE"):
+    master = st.session_state.angel_instruments
+    if master is None or master.empty:
+        master = download_instrument_master()
+        st.session_state.angel_instruments = master
+    if master.empty:
+        return None
+    cols = {str(c).lower(): c for c in master.columns}
+    symbol_col = cols.get("symboltoken")
+    exch_col = cols.get("exch_seg")
+    name_col = cols.get("name")
+    tsym_col = cols.get("symbol")
+    if not symbol_col or not exch_col or not tsym_col:
+        return None
+    frame = master[master[exch_col].astype(str).str.upper() == exchange.upper()].copy()
+    wanted = symbol.upper().replace(".NS", "")
+    exact = frame[frame[tsym_col].astype(str).str.upper() == wanted]
+    if exact.empty and name_col:
+        exact = frame[frame[name_col].astype(str).str.upper() == wanted]
+    if exact.empty:
+        # Yahoo labels are mapped to common Angel One trading symbols.
+        aliases = {"^NSEI": "NIFTY", "^NSEBANK": "BANKNIFTY", "^BSESN": "SENSEX"}
+        wanted = aliases.get(symbol, wanted)
+        exact = frame[frame[tsym_col].astype(str).str.upper().str.startswith(wanted)]
+    if exact.empty:
+        return None
+    return str(exact.iloc[0][symbol_col]), str(exact.iloc[0][tsym_col])
 
-def fetch_angel_candles(api, instrument, interval, lookback_days):
-    now = datetime.now()
-    start = now - pd.Timedelta(days=int(lookback_days))
-    response = api.getCandleData({
-        "exchange": instrument["exchange"],
-        "symboltoken": str(instrument["token"]),
+def get_angel_history(symbol, interval="FIVE_MINUTE", exchange="NSE"):
+    client = st.session_state.angel_session
+    if client is None:
+        return pd.DataFrame(), "Angel One is not connected."
+    resolved = find_angel_token(symbol, exchange)
+    if not resolved:
+        return pd.DataFrame(), f"Could not auto-resolve Angel One token for {symbol}. Try selecting its exact exchange symbol."
+    token, trading_symbol = resolved
+    to_dt = datetime.now()
+    from_dt = to_dt - timedelta(days=5)
+    params = {
+        "exchange": exchange, "symboltoken": token,
         "interval": interval,
-        "fromdate": start.strftime("%Y-%m-%d %H:%M"),
-        "todate": now.strftime("%Y-%m-%d %H:%M"),
-    })
-    if not response or response.get("status") is False or not response.get("data"):
-        message = (response or {}).get("message") or (response or {}).get("errorcode") or "No candles returned"
-        raise RuntimeError(f"Angel One candle request failed: {message}. Check API permissions, market hours and selected interval.")
-    cdf = pd.DataFrame(response["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-    cdf["timestamp"] = pd.to_datetime(cdf["timestamp"], errors="coerce")
-    for col in ["open", "high", "low", "close", "volume"]: cdf[col] = pd.to_numeric(cdf[col], errors="coerce")
-    return cdf.dropna(subset=["timestamp", "open", "high", "low", "close"]).set_index("timestamp").sort_index()
+        "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
+        "todate": to_dt.strftime("%Y-%m-%d %H:%M"),
+    }
+    try:
+        response = client.getCandleData(params)
+        rows = (response or {}).get("data") or []
+        if not rows:
+            return pd.DataFrame(), f"No candle data returned for {trading_symbol}: {(response or {}).get('message', '')}"
+        df = pd.DataFrame(rows, columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
+        df["Datetime"] = pd.to_datetime(df["Datetime"])
+        df = df.set_index("Datetime")
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df.dropna(subset=["Close"]), f"Angel One candles: {trading_symbol} (token auto-resolved)"
+    except Exception as exc:
+        return pd.DataFrame(), f"Angel One candle request failed: {exc}"
 
-def norm(raw):
-    if raw is None or raw.empty: return pd.DataFrame()
-    x=raw.copy()
-    if isinstance(x.columns,pd.MultiIndex): x.columns=x.columns.get_level_values(0)
-    x.columns=[str(c).lower().replace(' ','') for c in x.columns]
-    if not all(c in x.columns for c in ['open','high','low','close']): return pd.DataFrame()
-    if 'volume' not in x: x['volume']=0.0
-    for c in ['open','high','low','close','volume']: x[c]=pd.to_numeric(x[c],errors='coerce')
-    return x.dropna(subset=['open','high','low','close']).loc[lambda z: ~z.index.duplicated(keep='last')].sort_index()
-@st.cache_data(ttl=15,show_spinner=False)
-def yahoo(ticker,period,interval):
-    try: return norm(yf.download(ticker,period=period,interval=interval,auto_adjust=False,progress=False,threads=False))
-    except Exception: return pd.DataFrame()
-def resample(x,rule):
-    if x.empty:return x
-    return x.resample(rule).agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna(subset=['open','high','low','close'])
-def indicators(x):
-    d=x.copy().sort_index()
-    d['ema20']=d.close.ewm(span=20,adjust=False).mean(); d['ema50']=d.close.ewm(span=50,adjust=False).mean()
-    # MACD and Bollinger Bands are calculated on the same candle series used for signal scoring
-    d['macd']=d.close.ewm(span=12,adjust=False).mean()-d.close.ewm(span=26,adjust=False).mean()
-    d['macd_signal']=d.macd.ewm(span=9,adjust=False).mean(); d['macd_hist']=d.macd-d.macd_signal
-    d['bb_mid']=d.close.rolling(20,min_periods=20).mean(); d['bb_std']=d.close.rolling(20,min_periods=20).std(ddof=0)
-    d['bb_upper']=d.bb_mid+2*d.bb_std; d['bb_lower']=d.bb_mid-2*d.bb_std
-    for n in [20,50,100,200]: d[f'sma{n}']=d.close.rolling(n,min_periods=n).mean()
-    delta=d.close.diff(); gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False,min_periods=14).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False,min_periods=14).mean()
-    rs=gain/loss.replace(0,np.nan); d['rsi']=100-100/(1+rs); d.loc[(loss==0)&(gain>0),'rsi']=100; d.loc[(gain==0)&(loss>0),'rsi']=0
-    pc=d.close.shift(); tr=pd.concat([d.high-d.low,(d.high-pc).abs(),(d.low-pc).abs()],axis=1).max(axis=1); d['atr']=tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
-    up=d.high.diff(); down=-d.low.diff(); pdm=pd.Series(np.where((up>down)&(up>0),up,0),index=d.index); mdm=pd.Series(np.where((down>up)&(down>0),down,0),index=d.index)
-    d['di_plus']=100*pdm.ewm(alpha=1/14,adjust=False,min_periods=14).mean()/d.atr.replace(0,np.nan); d['di_minus']=100*mdm.ewm(alpha=1/14,adjust=False,min_periods=14).mean()/d.atr.replace(0,np.nan)
-    d['dx']=100*(d.di_plus-d.di_minus).abs()/(d.di_plus+d.di_minus).replace(0,np.nan); d['adx']=d.dx.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
-    lo=d.low.rolling(14).min(); hi=d.high.rolling(14).max(); d['stoch_k']=100*(d.close-lo)/(hi-lo).replace(0,np.nan); d['stoch_d']=d.stoch_k.rolling(3).mean()
-    typical=(d.high+d.low+d.close)/3; sess=pd.Series(pd.DatetimeIndex(d.index).date,index=d.index); pv=typical*d.volume
-    d['vwap']=pv.groupby(sess).cumsum()/d.volume.groupby(sess).cumsum().replace(0,np.nan)
-    d['vol_avg20']=d.volume.rolling(20,min_periods=5).mean(); d['vol_ratio']=d.volume/d.vol_avg20.replace(0,np.nan)
-    d['prior_high20']=d.high.rolling(20,min_periods=10).max().shift(1); d['prior_low20']=d.low.rolling(20,min_periods=10).min().shift(1)
-    # Simplified, vectorised candlestick confirmation features for scoring
-    po=d.open.shift(1); pc=d.close.shift(1); body=(d.close-d.open).abs(); rng=(d.high-d.low).replace(0,np.nan)
-    prev_body=(pc-po).abs()
-    d['bull_pattern_score']=0
-    d['bear_pattern_score']=0
-    bull_eng=(d.close>d.open)&(pc<po)&(d.close>=po)&(d.open<=pc)
-    bear_eng=(d.close<d.open)&(pc>po)&(d.open>=pc)&(d.close<=po)
-    lower=d[['open','close']].min(axis=1)-d.low; upper=d.high-d[['open','close']].max(axis=1)
-    hammer=(lower>=2*body.clip(lower=1e-9))&(upper<=body.clip(lower=1e-9)*1.2)&(d.close>d.open)
-    shooting=(upper>=2*body.clip(lower=1e-9))&(lower<=body.clip(lower=1e-9)*1.2)&(d.close<d.open)
-    doji=(body/rng<=.1)
-    # Single-candle and two-candle pattern scores. These scores feed get_signal().
-    bull_harami=(pc<po)&(d.close>d.open)&(d.open>=pc)&(d.close<=po)
-    bear_harami=(pc>po)&(d.close<d.open)&(d.open<=pc)&(d.close>=po)
-    midpoint_prev=(po+pc)/2
-    piercing=(pc<po)&(d.close>d.open)&(d.open<pc)&(d.close>midpoint_prev)&(d.close<po)
-    dark_cloud=(pc>po)&(d.close<d.open)&(d.open>pc)&(d.close<midpoint_prev)&(d.close>po)
-    d['bull_pattern_score'] = (bull_eng.astype(int) + hammer.astype(int) + bull_harami.astype(int) + piercing.astype(int))
-    d['bear_pattern_score'] = (bear_eng.astype(int) + shooting.astype(int) + bear_harami.astype(int) + dark_cloud.astype(int))
-    # Three-candle reversal patterns; simplified rules for screening, not guarantees.
-    po2=d.open.shift(2); pc2=d.close.shift(2); body2=(pc2-po2).abs()
-    morning=(pc2<po2)&(prev_body<body2*.6)&(d.close>d.open)&(d.close>(po2+pc2)/2)
-    evening=(pc2>po2)&(prev_body<body2*.6)&(d.close<d.open)&(d.close<(po2+pc2)/2)
-    bull_soldiers=(d.close>d.open)&(pc>po)&(pc2>po2)&(d.close>pc)&(pc>pc2)
-    bear_crows=(d.close<d.open)&(pc<po)&(pc2<po2)&(d.close<pc)&(pc<pc2)
-    d.loc[morning|bull_soldiers,'bull_pattern_score'] += 1
-    d.loc[evening|bear_crows,'bear_pattern_score'] += 1
-    d.loc[doji,'bull_pattern_score']=0; d.loc[doji,'bear_pattern_score']=0
+def add_indicators(df):
+    if df.empty:
+        return df
+    d = df.copy()
+    close, high, low, volume = d["Close"], d["High"], d["Low"], d["Volume"].fillna(0)
+    d["EMA9"] = close.ewm(span=9, adjust=False).mean()
+    d["EMA20"] = close.ewm(span=20, adjust=False).mean()
+    d["EMA50"] = close.ewm(span=50, adjust=False).mean()
+    d["SMA20"] = close.rolling(20).mean()
+    d["SMA50"] = close.rolling(50).mean()
+    d["SMA100"] = close.rolling(100).mean()
+    d["SMA200"] = close.rolling(200).mean()
+    d["MACD"] = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    d["MACD_Signal"] = d["MACD"].ewm(span=9, adjust=False).mean()
+    d["BB_Mid"] = close.rolling(20).mean()
+    std = close.rolling(20).std()
+    d["BB_Upper"], d["BB_Lower"] = d["BB_Mid"] + 2 * std, d["BB_Mid"] - 2 * std
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    d["ATR"] = tr.rolling(14).mean()
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    d["RSI"] = 100 - (100 / (1 + rs))
+    low14, high14 = low.rolling(14).min(), high.rolling(14).max()
+    d["Stoch_K"] = 100 * (close - low14) / (high14 - low14).replace(0, np.nan)
+    d["Stoch_D"] = d["Stoch_K"].rolling(3).mean()
+    typical = (high + low + close) / 3
+    cumulative_vol = volume.replace(0, np.nan).cumsum()
+    d["VWAP"] = (typical * volume).cumsum() / cumulative_vol
+    d["Vol_Avg20"] = volume.rolling(20).mean()
+    d["Vol_Ratio"] = volume / d["Vol_Avg20"].replace(0, np.nan)
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    atr_smooth = tr.rolling(14).mean().replace(0, np.nan)
+    d["Plus_DI"] = 100 * plus_dm.rolling(14).mean() / atr_smooth
+    d["Minus_DI"] = 100 * minus_dm.rolling(14).mean() / atr_smooth
+    dx = 100 * (d["Plus_DI"] - d["Minus_DI"]).abs() / (d["Plus_DI"] + d["Minus_DI"]).replace(0, np.nan)
+    d["ADX"] = dx.rolling(14).mean()
+    d["Pivot"] = (high.shift(1) + low.shift(1) + close.shift(1)) / 3
+    d["Support"] = low.rolling(20).min()
+    d["Resistance"] = high.rolling(20).max()
+    # Previous-candle levels are available on intraday feeds; daily timeframe means prior day.
+    d["Previous High"] = high.shift(1)
+    d["Previous Low"] = low.shift(1)
+    d["Previous Close"] = close.shift(1)
     return d
-def patterns(d):
-    if len(d)<3:return ['Insufficient candles']
-    a,b,c=d.iloc[-1],d.iloc[-2],d.iloc[-3]
-    body=abs(a.close-a.open); rng=max(a.high-a.low,1e-9)
-    upper=a.high-max(a.open,a.close); lower=min(a.open,a.close)-a.low; out=[]
-    # Two-candle patterns
-    if a.close>a.open and b.close<b.open and a.close>=b.open and a.open<=b.close: out.append('Bullish Engulfing')
-    if a.close<a.open and b.close>b.open and a.open>=b.close and a.close<=b.open: out.append('Bearish Engulfing')
-    if b.close<b.open and a.close>a.open and a.open<=b.close and a.close>=(b.open+b.close)/2: out.append('Piercing Pattern')
-    if b.close>b.open and a.close<a.open and a.open>=b.close and a.close<=(b.open+b.close)/2: out.append('Dark Cloud Cover')
-    if b.close<b.open and a.close>a.open and a.open>=b.close and a.close<=b.open: out.append('Bullish Harami')
-    if b.close>b.open and a.close<a.open and a.open<=b.close and a.close>=b.open: out.append('Bearish Harami')
-    # Single-candle patterns
-    if body/rng<=.1: out.append('Doji')
-    if lower>=2*max(body,1e-9) and upper<=max(body,1e-9)*1.2: out.append('Hammer')
-    if upper>=2*max(body,1e-9) and lower<=max(body,1e-9)*1.2: out.append('Shooting Star')
-    # Three-candle patterns
-    if c.close<c.open and abs(b.close-b.open)<abs(c.close-c.open)*.6 and a.close>a.open and a.close>(c.open+c.close)/2: out.append('Morning Star (possible)')
-    if c.close>c.open and abs(b.close-b.open)<abs(c.close-c.open)*.6 and a.close<a.open and a.close<(c.open+c.close)/2: out.append('Evening Star (possible)')
-    if c.close<c.open and b.close>b.open and a.close>a.open and b.close>c.close and a.close>b.close: out.append('Three White Soldiers (possible)')
-    if c.close>c.open and b.close<b.open and a.close<a.open and b.close<c.close and a.close<b.close: out.append('Three Black Crows (possible)')
-    if a.high<b.high and a.low>b.low: out.append('Inside Bar')
-    if a.high>b.high and a.low<b.low: out.append('Outside Bar')
-    return out or ['No major pattern detected']
-def safe(v):
-    try: return float(v) if pd.notna(v) and np.isfinite(float(v)) else np.nan
-    except Exception:return np.nan
-def fmt(v,n=2): return 'N/A' if not np.isfinite(safe(v)) else f'{safe(v):,.{n}f}'
-def get_signal(r):
-    bull=bear=0; reasons=[]
-    if r.close>r.ema20: bull+=1; reasons.append('Price > EMA20')
-    elif r.close<r.ema20: bear+=1; reasons.append('Price < EMA20')
-    if r.ema20>r.ema50: bull+=1
-    elif r.ema20<r.ema50: bear+=1
-    if pd.notna(r.vwap):
-        if r.close>r.vwap: bull+=1
-        elif r.close<r.vwap: bear+=1
-    if pd.notna(r.rsi):
-        if 52<=r.rsi<=70: bull+=1
-        elif 30<=r.rsi<=48: bear+=1
-    if pd.notna(r.adx) and r.adx>=18:
-        if r.di_plus>r.di_minus: bull+=1
-        elif r.di_minus>r.di_plus: bear+=1
-    if pd.notna(r.vol_ratio) and r.vol_ratio>=1.2:
-        if r.close>r.open: bull+=1
-        elif r.close<r.open: bear+=1
-    if pd.notna(r.prior_high20) and r.close>r.prior_high20: bull+=2; reasons.append('20-candle breakout')
-    if pd.notna(r.prior_low20) and r.close<r.prior_low20: bear+=2; reasons.append('20-candle breakdown')
-    if 'bull_pattern_score' in r.index and r.bull_pattern_score>0: bull+=1; reasons.append('Bullish candle pattern')
-    if 'bear_pattern_score' in r.index and r.bear_pattern_score>0: bear+=1; reasons.append('Bearish candle pattern')
-    # EMA, MACD and Bollinger confirmation all contribute to the combined signal.
-    if pd.notna(r.get('macd',np.nan)) and pd.notna(r.get('macd_signal',np.nan)):
-        if r.macd>r.macd_signal and r.macd_hist>0: bull+=1; reasons.append('MACD bullish')
-        elif r.macd<r.macd_signal and r.macd_hist<0: bear+=1; reasons.append('MACD bearish')
-    if pd.notna(r.get('bb_mid',np.nan)) and pd.notna(r.get('bb_upper',np.nan)) and pd.notna(r.get('bb_lower',np.nan)):
-        if r.close>r.bb_mid and r.close<r.bb_upper: bull+=1; reasons.append('Bollinger midline bullish')
-        elif r.close<r.bb_mid and r.close>r.bb_lower: bear+=1; reasons.append('Bollinger midline bearish')
-        elif r.close>=r.bb_upper and r.close>r.open: bull+=1; reasons.append('Upper-band momentum')
-        elif r.close<=r.bb_lower and r.close<r.open: bear+=1; reasons.append('Lower-band momentum')
-    sig='BUY' if bull>=4 and bull>=bear+2 else 'SELL' if bear>=4 and bear>=bull+2 else 'WAIT'
-    return sig,bull,bear,reasons
-def pct(s):
-    if len(s)<2:return np.nan
-    p=safe(s.iloc[-2]); q=safe(s.iloc[-1]); return (q/p-1)*100 if np.isfinite(p) and p else np.nan
-def daily_info(ticker):
-    d=yahoo(ticker,'2y','1d')
-    if d.empty:return d,{}
-    d=indicators(d); prev=d.iloc[-2] if len(d)>1 else d.iloc[-1]; last=d.iloc[-1]
-    lev={'Previous Close':safe(prev.close),'Previous High':safe(prev.high),'Previous Low':safe(prev.low)}
-    for n in [20,50,100,200]:lev[f'{n} DMA']=safe(last[f'sma{n}'])
-    return d,lev
-def mtf(ticker):
-    out=[]; cache={}
-    for label,iv in [('1m','1m'),('3m','1m'),('5m','5m'),('15m','15m')]:
-        if iv not in cache:cache[iv]=yahoo(ticker,'5d',iv)
-        x=cache[iv].copy()
-        if label=='3m' and not x.empty:x=resample(x,'3min')
-        if len(x)<30:
-            out.append({'Timeframe':label,'Trend':'N/A','Signal':'N/A','RSI':np.nan,'ADX':np.nan,'Last candle':'N/A'}); continue
-        z=indicators(x); r=z.iloc[-1]; sig,_,_,_=get_signal(r)
-        out.append({'Timeframe':label,'Trend':'Bullish' if r.ema20>r.ema50 else 'Bearish' if r.ema20<r.ema50 else 'Sideways','Signal':sig,'RSI':safe(r.rsi),'ADX':safe(r.adx),'Last candle':str(z.index[-1])})
-    return pd.DataFrame(out)
-def adaptive_atr_multiplier(price_value, atr_value, adx_value=np.nan):
-    """Return a volatility-adjusted ATR stop multiplier; this is a rule, not a guarantee."""
-    pv=safe(price_value); av=safe(atr_value); ax=safe(adx_value)
-    if not np.isfinite(pv) or pv<=0 or not np.isfinite(av) or av<=0:
-        return 1.5
-    atr_pct=av/pv*100
-    if atr_pct < 0.35: mult=1.20
-    elif atr_pct < 0.75: mult=1.50
-    elif atr_pct < 1.25: mult=1.80
-    elif atr_pct < 2.00: mult=2.20
-    else: mult=2.60
-    if np.isfinite(ax) and ax>=30: mult+=0.20
-    elif np.isfinite(ax) and ax<15: mult-=0.10
-    return float(np.clip(mult,1.0,3.0))
 
-@st.cache_data(ttl=300, show_spinner=False)
-def global_context_changes():
-    """Best-effort daily changes; missing/failed quotes stay unavailable."""
-    mapping={"S&P 500":"^GSPC", "Nasdaq":"^IXIC", "Brent":"BZ=F", "USD/INR":"INR=X", "India VIX":"^INDIAVIX"}
-    out={}
-    for label,tick in mapping.items():
-        q=yahoo(tick,"5d","1d")
-        out[label]=pct(q.close) if not q.empty else np.nan
+def detect_candle_patterns(d):
+    """Return pattern labels for each candle; multi-candle patterns are confirmed on the last candle."""
+    out = pd.Series("", index=d.index, dtype=object)
+    if len(d) == 0:
+        return out
+    for i in range(len(d)):
+        a = d.iloc[i]
+        o, h, l, c = map(float, (a["Open"], a["High"], a["Low"], a["Close"]))
+        body = abs(c-o); rng = max(h-l, 1e-12)
+        upper = h-max(o,c); lower = min(o,c)-l
+        labels=[]
+        if body/rng <= 0.08: labels.append("Doji")
+        if body/rng <= 0.30 and upper > body and lower > body: labels.append("Spinning Top")
+        if lower >= max(body*2, rng*0.45) and upper <= max(body*0.6, rng*0.12): labels.append("Hammer / Hanging Man shape")
+        if upper >= max(body*2, rng*0.45) and lower <= max(body*0.6, rng*0.12): labels.append("Inverted Hammer / Shooting Star shape")
+        if body/rng >= 0.88 and c > o: labels.append("Bullish Marubozu-like")
+        if body/rng >= 0.88 and c < o: labels.append("Bearish Marubozu-like")
+        if i >= 1:
+            p = d.iloc[i-1]; po, ph, pl, pc = map(float,(p["Open"],p["High"],p["Low"],p["Close"]))
+            if c>o and pc<po and o<=pc and c>=po: labels.append("Bullish Engulfing")
+            if c<o and pc>po and o>=pc and c<=po: labels.append("Bearish Engulfing")
+            if h<ph and l>pl: labels.append("Inside Bar")
+            if h>ph and l<pl: labels.append("Outside Bar")
+            if abs(h-ph) <= rng*0.08 and c<o and pc>po: labels.append("Possible Tweezer Top")
+            if abs(l-pl) <= rng*0.08 and c>o and pc<po: labels.append("Possible Tweezer Bottom")
+            mid=(po+pc)/2
+            if c>o and pc<po and o<pl and c>mid and c<po: labels.append("Piercing Line candidate")
+            if c<o and pc>po and o>ph and c<mid and c>po: labels.append("Dark Cloud Cover candidate")
+        if i >= 2:
+            p1=d.iloc[i-1]; p2=d.iloc[i-2]
+            o1,c1=float(p1["Open"]),float(p1["Close"]); o2,c2=float(p2["Open"]),float(p2["Close"])
+            b0=abs(c2-o2); b1=abs(c1-o1)
+            if c2<o2 and b1 < b0*0.55 and c>o and c>(o2+c2)/2: labels.append("Morning Star candidate")
+            if c2>o2 and b1 < b0*0.55 and c<o and c<(o2+c2)/2: labels.append("Evening Star candidate")
+            if all(float(d.iloc[j]["Close"])>float(d.iloc[j]["Open"]) for j in [i-2,i-1,i]) and c>c1>c2: labels.append("Three White Soldiers candidate")
+            if all(float(d.iloc[j]["Close"])<float(d.iloc[j]["Open"]) for j in [i-2,i-1,i]) and c<c1<c2: labels.append("Three Black Crows candidate")
+        out.iloc[i] = "; ".join(dict.fromkeys(labels))
     return out
 
-def combined_confidence(last_row, bull_score, bear_score, pcr_value, fii_value, dii_value, news_bias, event_risk, pattern_list):
-    """Directional confluence score (not a probability of profit). Missing feeds lower coverage."""
-    factors=[]
-    # Technical direction from the same indicators used by the signal engine.
-    tech_dir=1 if bull_score>bear_score else -1 if bear_score>bull_score else 0
-    factors.append(("Technical score",tech_dir,2.0,True))
-    factors.append(("EMA trend",1 if last_row.ema20>last_row.ema50 else -1 if last_row.ema20<last_row.ema50 else 0,1.0,pd.notna(last_row.ema20) and pd.notna(last_row.ema50)))
-    factors.append(("MACD",1 if last_row.macd>last_row.macd_signal else -1 if last_row.macd<last_row.macd_signal else 0,1.0,pd.notna(last_row.macd) and pd.notna(last_row.macd_signal)))
-    rsi=safe(last_row.rsi); factors.append(("RSI",1 if 52<=rsi<=70 else -1 if 30<=rsi<=48 else 0,.7,np.isfinite(rsi)))
-    pat_bull=any("Bullish" in x or "Hammer" in x or "Morning Star" in x or "White Soldiers" in x for x in pattern_list)
-    pat_bear=any("Bearish" in x or "Shooting Star" in x or "Evening Star" in x or "Black Crows" in x for x in pattern_list)
-    factors.append(("Candlestick patterns",1 if pat_bull and not pat_bear else -1 if pat_bear and not pat_bull else 0,1.0,not (pattern_list==['No major pattern detected'] or pattern_list==['Insufficient candles'])))
-    factors.append(("PCR",1 if np.isfinite(pcr_value) and pcr_value>=1.15 else -1 if np.isfinite(pcr_value) and pcr_value<=.80 else 0,.6,np.isfinite(pcr_value)))
-    # Cash-market FII/DII values are user-entered fallback unless a separate authorized feed is connected.
-    factors.append(("FII/FPI",1 if np.isfinite(fii_value) and fii_value>0 else -1 if np.isfinite(fii_value) and fii_value<0 else 0,.5,np.isfinite(fii_value)))
-    factors.append(("DII",1 if np.isfinite(dii_value) and dii_value>0 else -1 if np.isfinite(dii_value) and dii_value<0 else 0,.35,np.isfinite(dii_value)))
-    glob=global_context_changes()
-    for label,weight in [("S&P 500",.35),("Nasdaq",.35)]:
-        v=glob.get(label,np.nan); factors.append((label,1 if np.isfinite(v) and v>.15 else -1 if np.isfinite(v) and v<-.15 else 0,weight,np.isfinite(v)))
-    # These are context flags, not hard-coded claims about market direction.
-    for label in ("Brent","USD/INR","India VIX"):
-        factors.append((label,0,.2,np.isfinite(glob.get(label,np.nan))))
-    if news_bias=='Positive': factors.append(("News",1,.5,True))
-    elif news_bias=='Negative': factors.append(("News",-1,.5,True))
-    elif news_bias=='Mixed': factors.append(("News",0,.5,True))
-    else: factors.append(("News",0,.5,False))
-    if event_risk=='High': factors.append(("Event risk",0,1.0,True))
-    elif event_risk in ('Low','Moderate'): factors.append(("Event risk",0,.5,True))
-    else: factors.append(("Event risk",0,.5,False))
-    available=[f for f in factors if f[3]]
-    if not available: return 5,0,0,len(factors),0,glob
-    directional_weight=sum(w for _,d,w,_ in available if d!=0)
-    agree_weight=sum(w for _,d,w,_ in available if d==tech_dir and d!=0) if tech_dir else 0
-    coverage=sum(w for _,_,w,_ in available)/sum(w for _,_,w,_ in factors)
-    agreement=(agree_weight/directional_weight) if directional_weight else .5
-    # A conservative bounded confluence index; not a calibrated probability.
-    score=round(float(np.clip((50+35*(agreement-.5))*coverage,5,95)))
-    return score, int(sum(1 for _,d,_,ok in available if ok and d==1)), int(sum(1 for _,d,_,ok in available if ok and d==-1)), len(factors), round(coverage*100), glob
+def candle_patterns(d):
+    if len(d) < 1: return []
+    label = detect_candle_patterns(d).iloc[-1]
+    return label.split("; ") if label else ["No major pattern detected"]
 
-def backtest(x,rr,atrmult,cost_bps):
-    d=indicators(x); trades=[]; pos=None; fee=cost_bps/10000
-    if len(d)<60:return pd.DataFrame(),{'Total Trades':0,'Wins':0,'Losses':0,'Win Rate %':0,'Net Return %':0,'Profit Factor':np.nan,'Max Drawdown %':0}
-    for i in range(55,len(d)-1):
-        r=d.iloc[i]; nxt=d.iloc[i+1]; sig,_,_,_=get_signal(r)
-        if pos:
-            stop_hit=(r.low<=pos['stop']) if pos['side']=='LONG' else (r.high>=pos['stop'])
-            target_hit=(r.high>=pos['target']) if pos['side']=='LONG' else (r.low<=pos['target'])
-            exitp=reason=None
-            if stop_hit:exitp=pos['stop'];reason='Stop Loss'
-            elif target_hit:exitp=pos['target'];reason='Target'
-            elif (pos['side']=='LONG' and sig=='SELL') or (pos['side']=='SHORT' and sig=='BUY'):exitp=r.close;reason='Opposite signal'
-            else:
-                av=safe(r.atr)
-                if np.isfinite(av) and av>0:
-                    current_mult=adaptive_atr_multiplier(r.close,av,r.adx)
-                    pos['stop']=max(pos['stop'],r.close-current_mult*av) if pos['side']=='LONG' else min(pos['stop'],r.close+current_mult*av)
-            if exitp is not None:
-                gross=(exitp-pos['entry'])/pos['entry'] if pos['side']=='LONG' else (pos['entry']-exitp)/pos['entry']; net=(gross-2*fee)*100
-                trades.append({'Entry Time':pos['time'],'Exit Time':str(d.index[i]),'Side':pos['side'],'Entry':pos['entry'],'Exit':exitp,'Net Return %':net,'Result':'Win' if net>0 else 'Loss','Exit Reason':reason});pos=None
-        if pos is None and sig in ('BUY','SELL'):
-            av=safe(r.atr); ep=safe(nxt.open)
-            if not np.isfinite(av) or av<=0 or not np.isfinite(ep) or ep<=0:continue
-            side='LONG' if sig=='BUY' else 'SHORT'; entry_mult=adaptive_atr_multiplier(ep,av,r.adx); risk=av*entry_mult
-            pos={'side':side,'entry':ep,'stop':ep-risk if side=='LONG' else ep+risk,'target':ep+risk*rr if side=='LONG' else ep-risk*rr,'time':str(d.index[i+1]),'ATR Multiplier':entry_mult}
-    t=pd.DataFrame(trades)
-    if t.empty:return t,{'Total Trades':0,'Wins':0,'Losses':0,'Win Rate %':0,'Net Return %':0,'Profit Factor':np.nan,'Max Drawdown %':0}
-    wins=int((t['Net Return %']>0).sum()); losses=len(t)-wins; gp=t.loc[t['Net Return %']>0,'Net Return %'].sum(); gl=abs(t.loc[t['Net Return %']<=0,'Net Return %'].sum()); eq=(1+t['Net Return %']/100).cumprod(); dd=(eq/eq.cummax()-1).min()*100
-    return t,{'Total Trades':len(t),'Wins':wins,'Losses':losses,'Win Rate %':wins/len(t)*100,'Net Return %':(eq.iloc[-1]-1)*100,'Profit Factor':gp/gl if gl else np.inf,'Max Drawdown %':abs(dd)}
+def add_price_action_columns(d):
+    x=d.copy()
+    x["Candle Type"] = np.where(x["Close"]>x["Open"],"Bullish",np.where(x["Close"]<x["Open"],"Bearish","Doji"))
+    x["Body"]=(x["Close"]-x["Open"]).abs()
+    x["Upper Wick"]=x["High"]-x[["Open","Close"]].max(axis=1)
+    x["Lower Wick"]=x[["Open","Close"]].min(axis=1)-x["Low"]
+    x["Range"]=x["High"]-x["Low"]
+    x["Body %"]=(100*x["Body"]/x["Range"].replace(0,np.nan)).round(1)
+    x["Pattern"]=detect_candle_patterns(x)
+    prev_high=x["High"].shift(1).rolling(10).max()
+    prev_low=x["Low"].shift(1).rolling(10).min()
+    x["Price Action"]="Range / no confirmed break"
+    x.loc[x["Close"]>prev_high,"Price Action"]="Bullish BOS / 10-bar breakout"
+    x.loc[x["Close"]<prev_low,"Price Action"]="Bearish BOS / 10-bar breakdown"
+    # HH/HL/LH/LL are simple rolling comparisons, not swing-point-perfect labels.
+    x["Structure"]="—"
+    x.loc[(x["High"]>x["High"].shift(1)) & (x["Low"]>x["Low"].shift(1)),"Structure"]="HH + HL"
+    x.loc[(x["High"]<x["High"].shift(1)) & (x["Low"]<x["Low"].shift(1)),"Structure"]="LH + LL"
+    x["Volume Status"] = np.where(x["Vol_Ratio"]>=1.2,"High volume",np.where(x["Vol_Ratio"]<0.8,"Low volume","Normal / unavailable"))
+    x["VWAP Position"] = np.where(x["Close"]>x["VWAP"],"Above VWAP", "Below VWAP")
+    return x
 
-# Sidebar controls
-st.sidebar.header('Market Controls')
-market=st.sidebar.selectbox('Instrument',list(SYMBOLS)+['Custom Yahoo ticker'])
-ticker=st.sidebar.text_input('Yahoo ticker',value='RELIANCE.NS') if market=='Custom Yahoo ticker' else SYMBOLS[market]
-chart_tf=st.sidebar.selectbox('Chart timeframe',['1 minute','3 minutes','5 minutes','15 minutes','30 minutes','60 minutes','1 day'],index=2)
-period_label=st.sidebar.selectbox('History',['1 day','5 days','1 month','3 months','6 months','1 year','2 years'],index=1)
-periods={'1 day':'1d','5 days':'5d','1 month':'1mo','3 months':'3mo','6 months':'6mo','1 year':'1y','2 years':'2y'}
-period=periods[period_label]; intervals={'1 minute':'1m','3 minutes':'1m','5 minutes':'5m','15 minutes':'15m','30 minutes':'30m','60 minutes':'60m','1 day':'1d'}; interval=intervals[chart_tf]
-if chart_tf in ('1 minute','3 minutes') and period not in ('1d','5d'): period='5d'
-data_source=st.sidebar.radio('Candle data source',['Yahoo Finance','Angel One API'],index=0)
-angel_interval={'1 minute':'ONE_MINUTE','3 minutes':'THREE_MINUTE','5 minutes':'FIVE_MINUTE','15 minutes':'FIFTEEN_MINUTE','30 minutes':'THIRTY_MINUTE','60 minutes':'ONE_HOUR','1 day':'ONE_DAY'}[chart_tf]
-angel_search = ''
-lookback_days = st.sidebar.selectbox('Angel One history days',[1,3,5,10,20,30],index=2) if data_source=='Angel One API' else 5
-if data_source=='Angel One API':
-    st.sidebar.success('Symbol token and exchange will be looked up automatically from Angel One instrument master.')
-    if market == 'Custom Yahoo ticker':
-        angel_search = st.sidebar.text_input('Angel One instrument search (symbol/name)', value='RELIANCE')
-    st.sidebar.warning('Only enter your own Angel One API credentials. Do not share API key, Client Code, PIN or TOTP secret. Credentials remain in this app session.')
-    with st.sidebar.form('angel_connect_form'):
-        akey=st.text_input('Angel One API Key',type='password')
-        client=st.text_input('Client Code')
-        apin=st.text_input('Trading PIN',type='password')
-        totp_secret=st.text_input('TOTP Secret',type='password')
-        connect_angel=st.form_submit_button('Connect Angel One')
-    if connect_angel:
-        try:
-            import pyotp
-            from SmartApi import SmartConnect
-            if not all([akey.strip(), client.strip(), apin.strip(), totp_secret.strip()]):
-                raise RuntimeError('Fill API Key, Client Code, Trading PIN and TOTP Secret.')
-            api=SmartConnect(api_key=akey.strip())
-            response=api.generateSession(client.strip(), apin.strip(), pyotp.TOTP(totp_secret.strip()).now())
-            if not response or response.get('status') is False:
-                raise RuntimeError((response or {}).get('message') or 'Login failed. Check credentials and TOTP.')
-            st.session_state.angel_api=api
-            st.session_state.angel_connected=True
-            st.session_state.angel_client_code=client.strip()
-            st.session_state.angel_candles=None
-            st.session_state.angel_candle_key=None
-            st.sidebar.success('Angel One connected. Resolving symbol and token automatically…')
-            st.rerun()
-        except Exception as exc:
-            st.sidebar.error(f'Angel One connection failed: {exc}')
-    if st.sidebar.button('Refresh Angel One instrument master'):
-        load_angel_master.clear()
-        st.rerun()
-auto=st.sidebar.toggle('Auto refresh ON/OFF',value=False); secs=st.sidebar.selectbox('Refresh interval (seconds)',[5,10,15,30,60],index=2)
-if auto:
-    if st_autorefresh:st_autorefresh(interval=secs*1000,key='refresh')
-    else:st.sidebar.error('Install streamlit-autorefresh to enable automatic refresh.')
-if st.sidebar.button('Refresh now',type='primary'):
-    st.cache_data.clear()
-    st.session_state.force_angel_refresh=True
-    st.rerun()
-rr=st.sidebar.selectbox('Target risk : reward',[1.0,1.5,2.0,3.0],index=2)
-st.sidebar.info('ATR stop multiplier: AUTO — adapts to ATR volatility and ADX trend strength.')
-risk_pct=st.sidebar.slider('Paper risk per trade (%)',0.25,2.0,1.0,0.25); capital=st.sidebar.number_input('Paper capital (₹)',min_value=1000.0,value=100000.0,step=5000.0)
-st.sidebar.divider()
-with st.sidebar.expander('Manual fallback (only if an automatic feed is unavailable)'):
-    use_manual_context=st.checkbox('Use manual PCR / FII-DII fallback',value=False)
-    manual_pcr=st.number_input('Fallback PCR',0.0,10.0,1.0,.05)
-    manual_fii=st.number_input('Fallback FII/FPI net (₹ crore)',value=0.0,step=100.0)
-    manual_dii=st.number_input('Fallback DII net (₹ crore)',value=0.0,step=100.0)
-news=st.sidebar.selectbox('Verified news bias',['Neutral/unknown','Positive','Negative','Mixed'])
-event=st.sidebar.selectbox('Government/geopolitical event risk',['Unknown/not checked','Low','Moderate','High'])
-
-# Automatic institutional flow is intentionally not fabricated: Angel One SmartAPI does not expose cash-market FII/DII net flows.
-# PCR uses Angel One's authenticated PCR endpoint when the user has connected SmartAPI.
-angel_api_for_pcr=st.session_state.get('angel_api')
-pcr_snapshot={"ok": False, "error": "Select Angel One API and connect to load automatic PCR."}
-if angel_api_for_pcr is not None:
-    pcr_snapshot=fetch_angel_pcr_snapshot(
-        getattr(angel_api_for_pcr, 'access_token', None),
-        getattr(angel_api_for_pcr, 'api_key', None),
-        st.session_state.get('angel_client_code',''), market)
-if pcr_snapshot.get('ok'):
-    pcr=float(pcr_snapshot['pcr'])
-    old_pcr=st.session_state.get('previous_auto_pcr')
-    pcr_delta=(pcr-float(old_pcr)) if old_pcr is not None else np.nan
-    st.session_state.previous_auto_pcr=pcr
-    pcr_source=pcr_snapshot.get('source','Angel One SmartAPI')
-    pcr_status='LIVE API' if data_source=='Angel One API' else 'Angel One connected'
-else:
-    pcr=float(manual_pcr) if use_manual_context else np.nan
-    pcr_delta=np.nan
-    pcr_source='Manual fallback' if use_manual_context else 'Unavailable'
-    pcr_status=pcr_snapshot.get('error','Unavailable')
-# SmartAPI PCR endpoint does not provide a prior-refresh OI-change series; do not invent it.
-call_oi=np.nan; put_oi=np.nan
-fii=float(manual_fii) if use_manual_context else np.nan
-dii=float(manual_dii) if use_manual_context else np.nan
-pcr_bias=('Bullish' if pcr>=1.15 else 'Bearish' if np.isfinite(pcr) and pcr<=0.80 else 'Mixed') if np.isfinite(pcr) else 'Not assessed'
-oi_bias='Not assessed'
-
-# Main data fetch
-if data_source=='Yahoo Finance':
-    with st.spinner('Fetching Yahoo Finance data...'):
-        raw=yahoo(ticker,period,interval); data=resample(raw,'3min') if chart_tf=='3 minutes' else raw
-else:
-    data=st.session_state.get('angel_candles')
-    if not st.session_state.get('angel_connected') or st.session_state.get('angel_api') is None:
-        st.info('Angel One selected. Enter your Angel One API Key, Client Code, Trading PIN and TOTP Secret in the sidebar, then press Connect Angel One. Symbol and token are automatic; you do not need to enter a token.')
-        st.stop()
-    try:
-        master=load_angel_master()
-        instrument=resolve_angel_instrument(master, market, angel_search)
-        st.session_state.angel_resolved_instrument=instrument
-        st.sidebar.caption(f"Resolved: {instrument['symbol']} • {instrument['exchange']} • token auto-loaded")
-        candle_key=(instrument['exchange'], instrument['symbol'], str(instrument['token']), angel_interval, int(lookback_days))
-        now_ts=time.time()
-        old_key=st.session_state.get('angel_candle_key')
-        last_fetch=st.session_state.get('angel_last_fetch_ts',0)
-        force_refresh=st.session_state.pop('force_angel_refresh', False)
-        should_fetch=(data is None or data.empty or old_key != candle_key or force_refresh or (auto and now_ts-last_fetch>=secs))
-        if should_fetch:
-            with st.spinner(f"Fetching Angel One candles for {instrument['symbol']}…"):
-                data=fetch_angel_candles(st.session_state.angel_api, instrument, angel_interval, lookback_days)
-                st.session_state.angel_candles=data
-                st.session_state.angel_candle_key=candle_key
-                st.session_state.angel_last_fetch_ts=now_ts
+def analyze_signal(d, rr_multiple=1.0):
+    if len(d) < 30:
+        return {"signal": "WAIT", "score": 0, "confidence": 0, "reason": "Not enough candles for stable indicators."}
+    a = d.iloc[-1]
+    score, reasons = 0, []
+    checks = [
+        (a["EMA9"] > a["EMA20"], 1, "EMA9 above EMA20", "EMA9 below EMA20"),
+        (a["Close"] > a["VWAP"], 1, "Price above VWAP", "Price below VWAP"),
+        (a["MACD"] > a["MACD_Signal"], 1, "MACD bullish", "MACD bearish"),
+        (a["RSI"] > 52, 1, "RSI bullish", "RSI not bullish"),
+        (a["Plus_DI"] > a["Minus_DI"] and a["ADX"] >= 18, 1, "ADX/DI bullish trend", "ADX/DI not bullish"),
+        (a["Close"] > a["BB_Mid"], 1, "Above Bollinger midline", "Below Bollinger midline"),
+        (a["Vol_Ratio"] >= 1.2, 1, "Volume above 1.2x average", "No strong volume expansion"),
+    ]
+    for condition, weight, bull, bear in checks:
+        if pd.notna(condition) and condition:
+            score += weight
+            reasons.append(bull)
         else:
-            data=st.session_state.angel_candles
-        ticker=instrument['symbol']
-    except Exception as exc:
-        st.error(f'Angel One data error: {exc}')
-        st.stop()
-if data.empty:
-    st.error(f'No data returned for {ticker}. Verify ticker/network/interval or broker symbol token.');st.stop()
-data=indicators(data); last=data.iloc[-1]; price=safe(last.close)
-if not np.isfinite(price):st.error('Latest price unavailable.');st.stop()
-daily,levels=daily_info(ticker); pats=patterns(data); signal,bull,bear,reasons=get_signal(last)
-# Current-bar context only. PCR is a soft confirmation, not a standalone trading signal.
-# FII/DII daily net flows are not part of Angel One SmartAPI, so unavailable values are not replaced with zero.
-if pcr_bias=='Bullish': bull+=1; reasons.append('Automatic PCR context: higher put/call ratio')
-elif pcr_bias=='Bearish': bear+=1; reasons.append('Automatic PCR context: lower put/call ratio')
-if news=='Positive': bull+=1; reasons.append('Manual news context: positive')
-elif news=='Negative': bear+=1; reasons.append('Manual news context: negative')
-if event=='High':
-    signal='WAIT'; reasons.append('High event risk: confirmation withheld')
-else:
-    signal='BUY' if bull>=4 and bull>=bear+2 else 'SELL' if bear>=4 and bear>=bull+2 else 'WAIT'
-atr=safe(last.atr)
-if not np.isfinite(atr) or atr<=0: atr=price*.005
-# Volatility-aware stop distance: ATR% sets the base multiplier, ADX slightly widens it in strong trends.
-atr_mult=adaptive_atr_multiplier(price,atr,last.adx)
-entry=price
-entry2=price-0.5*atr if signal=='BUY' else price+0.5*atr if signal=='SELL' else np.nan
-risk_distance=atr_mult*atr
-stop=price-risk_distance if signal=='BUY' else price+risk_distance if signal=='SELL' else np.nan
-target1=price+risk_distance if signal=='BUY' else price-risk_distance if signal=='SELL' else np.nan
-target2=price+risk_distance*rr if signal=='BUY' else price-risk_distance*rr if signal=='SELL' else np.nan
-target=target2
-confidence, conf_bull, conf_bear, conf_factor_count, conf_coverage, global_changes = combined_confidence(last,bull,bear,pcr,fii,dii,news,event,pats)
-
-st.subheader('1. Current Signal')
-c=st.columns(6); c[0].metric('Instrument',market);c[1].metric('Last Price',f'{price:,.2f}');c[2].metric('Signal',signal);c[3].metric('Bullish Score',bull);c[4].metric('Bearish Score',bear);c[5].metric('Multi-Factor Confidence',f'{confidence}%')
-st.caption(f'Source: {data_source} • Last candle: {data.index[-1]} • Confidence is a rule-based confluence index, not a calibrated probability of profit. Available-factor coverage: {conf_coverage}%.')
-st.write('Signal notes: '+' • '.join(reasons) if reasons else 'Signal notes: mixed/insufficient confirmation.')
-trend_now='Bullish' if last.ema20>last.ema50 else 'Bearish' if last.ema20<last.ema50 else 'Sideways'
-ctx=st.columns(6);ctx[0].metric('Trend',trend_now);ctx[1].metric('Volume ratio',fmt(last.vol_ratio));ctx[2].metric('PCR (auto)',fmt(pcr));ctx[3].metric('PCR change',fmt(pcr_delta));ctx[4].metric('Auto ATR multiplier',f'{atr_mult:.2f}x');ctx[5].metric('ADX',fmt(last.adx))
-
-st.subheader('2. Entry, Exit, Targets, Stop Loss & Trailing Stop')
-c=st.columns(7);c[0].metric('Entry 1',fmt(entry) if signal!='WAIT' else 'WAIT');c[1].metric('Entry 2 (ATR pullback)',fmt(entry2));c[2].metric('Stop Loss',fmt(stop));c[3].metric('Target 1 (1R)',fmt(target1));c[4].metric(f'Target 2 ({rr:g}R)',fmt(target2));c[5].metric('ATR',fmt(atr));c[6].metric('Risk : Reward',f'1 : {rr:g}' if signal!='WAIT' else 'N/A')
-trail=price-atr_mult*atr if signal=='BUY' else price+atr_mult*atr if signal=='SELL' else np.nan
-partial_exit_pct=st.select_slider('Suggested partial exit at Target 1 (%)',options=[25,33,50,75],value=50)
-st.metric('Indicative Trailing Stop',fmt(trail));st.caption(f'Paper/manual planning only: consider partial exit of {partial_exit_pct}% at Target 1. Entry 2 is an ATR pullback reference, not a guaranteed fill. No orders are sent to a broker.')
-with st.expander('Confidence factor details'):
-    st.write(f'Bullish directional factors: {conf_bull} • Bearish directional factors: {conf_bear} • Factors evaluated: {conf_factor_count} • Data coverage: {conf_coverage}%')
-    st.dataframe(pd.DataFrame([{'Factor':k,'Daily change %':v} for k,v in global_changes.items()]),use_container_width=True,hide_index=True)
-
-st.subheader('3. Price Chart & Indicators')
-st.caption('EMA, MACD and Bollinger Bands are included in the combined BUY/SELL/WAIT scoring, along with price action, RSI, ADX, VWAP, volume and candle patterns.')
-choices=st.multiselect('Overlay indicators',['EMA20','EMA50','VWAP','Bollinger Upper','Bollinger Mid','Bollinger Lower','SMA20','SMA50','SMA100','SMA200'],default=['EMA20','EMA50','Bollinger Upper','Bollinger Mid','Bollinger Lower','VWAP'])
-cmap={'EMA20':'ema20','EMA50':'ema50','VWAP':'vwap','Bollinger Upper':'bb_upper','Bollinger Mid':'bb_mid','Bollinger Lower':'bb_lower','SMA20':'sma20','SMA50':'sma50','SMA100':'sma100','SMA200':'sma200'}
-st.line_chart(data[['close']+[cmap[x] for x in choices]].tail(300),use_container_width=True)
-st.markdown('**MACD (12, 26, 9)**')
-st.line_chart(data[['macd','macd_signal']].tail(300),use_container_width=True)
-st.bar_chart(data[['macd_hist']].tail(100),use_container_width=True)
-c=st.columns(8);c[0].metric('RSI',fmt(last.rsi));c[1].metric('ADX',fmt(last.adx));c[2].metric('DI+',fmt(last.di_plus));c[3].metric('DI−',fmt(last.di_minus));c[4].metric('Stochastic %K',fmt(last.stoch_k));c[5].metric('Volume / Avg',fmt(last.vol_ratio));c[6].metric('MACD',fmt(last.macd));c[7].metric('MACD Signal',fmt(last.macd_signal))
-bbcols=st.columns(3);bbcols[0].metric('Bollinger Upper',fmt(last.bb_upper));bbcols[1].metric('Bollinger Mid',fmt(last.bb_mid));bbcols[2].metric('Bollinger Lower',fmt(last.bb_lower))
-
-st.subheader('4. Candlestick Patterns')
-st.write('Latest detected: '+' • '.join(pats));st.caption('Pattern rules are simplified. Confirm with context; a candle pattern alone is not a trade recommendation.')
-
-st.subheader('5. Multi-Timeframe Analysis (1m / 3m / 5m / 15m)')
-with st.spinner('Loading MTF data...'): st.dataframe(mtf(ticker),use_container_width=True,hide_index=True)
-st.caption('Yahoo may restrict intraday history. 3-minute bars are resampled from 1-minute data.')
-
-st.subheader('6. Previous Close, Support / Resistance & DMA')
-if levels:
-    rows=[]
-    for k,v in levels.items():rows.append({'Level':k,'Price':v,'Type':'Support candidate' if np.isfinite(v) and v<price else 'Resistance candidate' if np.isfinite(v) and v>price else 'Near price / N/A'})
-    if len(daily)>1:
-        p=(daily.high.iloc[-2]+daily.low.iloc[-2]+daily.close.iloc[-2])/3;rows += [{'Level':'Classic Pivot','Price':p,'Type':'Pivot'},{'Level':'Pivot R1','Price':2*p-daily.low.iloc[-2],'Type':'Resistance candidate'},{'Level':'Pivot S1','Price':2*p-daily.high.iloc[-2],'Type':'Support candidate'}]
-    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-    adr=(daily.high-daily.low).tail(14).mean() if len(daily)>1 else np.nan; adr_pct=adr/daily.close.iloc[-1]*100 if len(daily)>1 and daily.close.iloc[-1] else np.nan
-    c=st.columns(3);c[0].metric('ADR (14-day average range)',fmt(adr));c[1].metric('ADR %',fmt(adr_pct)+'%');c[2].metric('Previous Close',fmt(levels.get('Previous Close')))
-else:st.info('Daily levels unavailable.')
-
-st.subheader('7. Automatic PCR, FII / DII and Event Context')
-if pcr_snapshot.get('ok'):
-    st.success(f"PCR source: {pcr_source} • matched contract: {pcr_snapshot.get('symbol','N/A')} • updated: {pcr_snapshot.get('updated','N/A')}")
-else:
-    st.warning(f"Automatic PCR unavailable: {pcr_status}")
-if np.isfinite(fii) or np.isfinite(dii):
-    st.info('FII/DII values below are manual fallback inputs. They are not live values from Angel One.')
-else:
-    st.info('FII/FPI and DII cash-market net flows are not provided by the Angel One SmartAPI endpoint used here. To avoid fake values, the dashboard shows N/A until a licensed/authorized FII-DII data feed is connected.')
-c=st.columns(6)
-c[0].metric('PCR',fmt(pcr))
-c[1].metric('PCR change since refresh',fmt(pcr_delta))
-c[2].metric('Call OI change',fmt(call_oi))
-c[3].metric('Put OI change',fmt(put_oi))
-c[4].metric('FII/FPI net (₹ cr)',fmt(fii,0))
-c[5].metric('DII net (₹ cr)',fmt(dii,0))
-st.write(f'PCR interpretation: {pcr_bias} • OI interpretation: {oi_bias} • Verified news bias: {news} • Government/geopolitical event risk: {event}')
-st.caption('PCR is an options-market context metric, not a guaranteed direction predictor. PCR change is measured against the previous successful app refresh; it is N/A on the first fetch or when the feed is unavailable.')
-
-st.subheader('8. Indian Major Stocks & Global Markets — Horizontal Performance Board')
-watch_groups={
- 'INDIAN INDICES':{'NIFTY 50':'^NSEI','BANK NIFTY':'^NSEBANK','SENSEX':'^BSESN','NIFTY IT':'^CNXIT','NIFTY AUTO':'^CNXAUTO'},
- 'BANKING':{'HDFC Bank':'HDFCBANK.NS','ICICI Bank':'ICICIBANK.NS','SBI':'SBIN.NS','Axis Bank':'AXISBANK.NS','Kotak Bank':'KOTAKBANK.NS'},
- 'IT / TECHNOLOGY':{'TCS':'TCS.NS','Infosys':'INFY.NS','HCLTech':'HCLTECH.NS','Wipro':'WIPRO.NS','Tech Mahindra':'TECHM.NS'},
- 'AUTOMOBILE':{'Maruti':'MARUTI.NS','M&M':'M&M.NS','Tata Motors':'TMPV.NS','Bajaj Auto':'BAJAJ-AUTO.NS','Eicher Motors':'EICHERMOT.NS'},
- 'OTHER MAJOR STOCKS':{'Reliance':'RELIANCE.NS','L&T':'LT.NS','Bharti Airtel':'BHARTIARTL.NS','ITC':'ITC.NS'}
-}
-def snapshot(mapping):
-    out=[]
-    for name,tick in mapping.items():
-        q=yahoo(tick,'5d','1d')
-        last_close=safe(q.close.iloc[-1]) if not q.empty else np.nan
-        change=pct(q.close) if not q.empty else np.nan
-        out.append({'Instrument':name,'Ticker':tick,'Last Price':last_close,'Day Change %':change,'Performance':'▲ Positive' if np.isfinite(change) and change>0 else '▼ Negative' if np.isfinite(change) and change<0 else '— Flat / N/A' if np.isfinite(change) else 'Unavailable','Source':'Yahoo Finance' if not q.empty else 'Unavailable'})
-    return pd.DataFrame(out)
-def horizontal_board(title,mapping):
-    st.markdown(f'#### {title}')
-    snap=snapshot(mapping)
-    if snap.empty:
-        st.info('No data available for this group.')
-        return snap
-    # Each instrument gets a horizontal card with last price and daily performance.
-    for start in range(0,len(snap),4):
-        row=snap.iloc[start:start+4]
-        cols=st.columns(4)
-        for col,(_,item) in zip(cols,row.iterrows()):
-            change=item['Day Change %']
-            change_text=f"{change:+.2f}%" if np.isfinite(change) else 'N/A'
-            with col:
-                st.metric(str(item['Instrument']),fmt(item['Last Price']),change_text)
-    st.dataframe(snap,use_container_width=True,hide_index=True)
-    return snap
-with st.spinner('Loading Indian stocks and global markets...'):
-    all_india=[]
-    for group_name,group_map in watch_groups.items():
-        result=horizontal_board(group_name,group_map)
-        if not result.empty: all_india.append(result.assign(Sector=group_name))
-    st.markdown('#### GLOBAL MARKETS')
-    global_groups={
-      'US MARKETS':{'S&P 500':'^GSPC','Nasdaq':'^IXIC','Dow Jones':'^DJI'},
-      'ASIA MARKETS':{'Japan Nikkei':'^N225','Hong Kong Hang Seng':'^HSI','China Shanghai':'000001.SS','South Korea KOSPI':'^KS11'},
-      'MACRO / VOLATILITY':{'Brent Crude':'BZ=F','USD/INR':'INR=X','India VIX':'^INDIAVIX'}
-    }
-    for group_name,group_map in global_groups.items(): horizontal_board(group_name,group_map)
-st.caption('Daily performance is based on the latest two available daily closes, not necessarily a live tick. Closed markets and Yahoo data delays may affect timestamps. The combined signal uses the selected instrument indicators; this market board is contextual and does not silently force a trade.')
-
-st.subheader('9. Historical Backtest')
-st.caption('Simplified rule-based OHLC backtest: closed-bar signal, next-bar-open entry, ATR stop/target, one position at a time. Costs are an estimate; taxes, latency and exact fills are not fully modelled.')
-cost=st.slider('Estimated one-way cost + slippage (basis points)',0.0,50.0,5.0,1.0)
-if st.button('Run Backtest',type='primary'):
-    trades,stats=backtest(data,float(rr),float(atr_mult),float(cost));st.session_state.bt_trades=trades;st.session_state.bt_stats=stats
-if 'bt_stats' in st.session_state:
-    q=st.session_state.bt_stats;c=st.columns(6);c[0].metric('Total Trades',q['Total Trades']);c[1].metric('Wins',q['Wins']);c[2].metric('Losses',q['Losses']);c[3].metric('Win Rate',f"{q['Win Rate %']:.2f}%");c[4].metric('Net Return',f"{q['Net Return %']:.2f}%");pf=q['Profit Factor'];c[5].metric('Profit Factor','∞' if pf==np.inf else fmt(pf));st.metric('Maximum Drawdown',f"{q['Max Drawdown %']:.2f}%")
-    trades=st.session_state.bt_trades
-    if not trades.empty:
-        st.dataframe(trades.tail(200),use_container_width=True,hide_index=True);st.download_button('Download backtest CSV',trades.to_csv(index=False),'backtest_trades.csv','text/csv')
-    else:st.info('No completed trades for this period/settings. Try a longer period or different ticker.')
-
-st.subheader('10. Paper Trading & P/L')
-st.caption('Paper trades only. No real orders are placed.')
-if st.toggle('Show paper trading panel',value=True):
-    pos=st.session_state.paper_position
-    if pos is None:
-        with st.form('paper_open'):
-            side=st.selectbox('Direction',['LONG','SHORT']); pe=st.number_input('Entry price',min_value=.01,value=float(price)); qty=st.number_input('Quantity',min_value=1,value=1,step=1)
-            default_sl=float(max(.01,price-atr_mult*atr)) if side=='LONG' else float(price+atr_mult*atr)
-            default_tg=float(price+atr_mult*atr*rr) if side=='LONG' else float(max(.01,price-atr_mult*atr*rr))
-            sl=st.number_input('Stop loss',min_value=.01,value=default_sl);tg=st.number_input('Target',min_value=.01,value=default_tg);openp=st.form_submit_button('Open Paper Position')
-        if openp:
-            valid=(sl<pe<tg) if side=='LONG' else (tg<pe<sl)
-            if not valid:st.error('Stop/entry/target levels do not match selected direction.')
-            else:
-                cashrisk=abs(pe-sl)*qty
-                if cashrisk>capital*risk_pct/100:st.warning(f'Paper risk ₹{cashrisk:,.2f} exceeds configured budget ₹{capital*risk_pct/100:,.2f}.')
-                st.session_state.paper_position={'Symbol':ticker,'Side':side,'Entry':float(pe),'Quantity':int(qty),'Stop Loss':float(sl),'Target':float(tg),'Opened At':datetime.now().strftime('%Y-%m-%d %H:%M:%S')};st.rerun()
+            score -= weight
+            reasons.append(bear)
+    patterns = candle_patterns(d)
+    # Normalize pattern names so detector labels and scoring labels cannot silently disagree.
+    pattern_text = " ".join(patterns).lower()
+    bullish_pattern = any(term in pattern_text for term in [
+        "bullish engulfing", "hammer / hanging man", "inverted hammer",
+        "piercing line", "morning star", "three white soldiers", "tweezer bottom",
+        "bullish marubozu"
+    ])
+    bearish_pattern = any(term in pattern_text for term in [
+        "bearish engulfing", "shooting star", "dark cloud cover", "evening star",
+        "three black crows", "tweezer top", "bearish marubozu"
+    ])
+    if bullish_pattern and not bearish_pattern:
+        score += 1
+        reasons.append("Bullish candlestick pattern confirmation")
+    elif bearish_pattern and not bullish_pattern:
+        score -= 1
+        reasons.append("Bearish candlestick pattern confirmation")
+    signal = "BUY" if score >= 3 else "SELL" if score <= -3 else "WAIT"
+    # This is a heuristic score, NOT a statistically calibrated win probability.
+    confidence = int(min(95, abs(score) / 8 * 100))
+    entry = float(a["Close"])
+    atr = safe_float(a["ATR"], entry * 0.005)
+    if not np.isfinite(atr) or atr <= 0:
+        atr = entry * 0.005
+    risk_distance = 1.5 * atr
+    rr_multiple = float(rr_multiple) if float(rr_multiple) > 0 else 1.0
+    if signal == "BUY":
+        sl = entry - risk_distance
+        t1, t2, t3 = entry + risk_distance*rr_multiple, entry + risk_distance*rr_multiple*2, entry + risk_distance*rr_multiple*3
+    elif signal == "SELL":
+        sl = entry + risk_distance
+        t1, t2, t3 = entry - risk_distance*rr_multiple, entry - risk_distance*rr_multiple*2, entry - risk_distance*rr_multiple*3
     else:
-        side=pos['Side'];qty=pos['Quantity'];pnl=(price-pos['Entry'])*qty if side=='LONG' else (pos['Entry']-price)*qty;trail=price-atr_mult*atr if side=='LONG' else price+atr_mult*atr
-        c=st.columns(4);c[0].metric('Open position',f"{side} {qty} {pos['Symbol']}");c[1].metric('Entry',fmt(pos['Entry']));c[2].metric('Unrealised P&L',f'₹{pnl:,.2f}');c[3].metric('Indicative trailing SL',fmt(trail));st.write(f"Initial/current paper SL: {pos['Stop Loss']:.2f} • Target: {pos['Target']:.2f}")
-        if (side=='LONG' and price<=pos['Stop Loss']) or (side=='SHORT' and price>=pos['Stop Loss']):st.warning('Price crossed paper stop-loss; close/adjust manually.')
-        if (side=='LONG' and price>=pos['Target']) or (side=='SHORT' and price<=pos['Target']):st.success('Price reached paper target; close/adjust manually.')
-        c1,c2=st.columns(2)
-        if c1.button('Close Paper Position'):
-            st.session_state.paper_trades.append({'Symbol':ticker,'Side':side,'Entry':pos['Entry'],'Exit':price,'Quantity':qty,'P&L ₹':pnl,'Opened At':pos['Opened At'],'Closed At':datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'Result':'Win' if pnl>0 else 'Loss' if pnl<0 else 'Breakeven'});st.session_state.paper_position=None;st.rerun()
-        if c2.button('Move stop to trailing level'):
-            improve=trail>pos['Stop Loss'] if side=='LONG' else trail<pos['Stop Loss']
-            safe_side=(trail<price) if side=='LONG' else (trail>price)
-            if improve and safe_side:pos['Stop Loss']=float(trail);st.session_state.paper_position=pos;st.rerun()
-            else:st.info('Trailing stop does not improve current stop.')
-    if st.session_state.paper_trades:
-        pt=pd.DataFrame(st.session_state.paper_trades);wins=int((pt['P&L ₹']>0).sum());losses=int((pt['P&L ₹']<0).sum());net=pt['P&L ₹'].sum();c=st.columns(4);c[0].metric('Closed trades',len(pt));c[1].metric('Wins',wins);c[2].metric('Losses',losses);c[3].metric('Realised P&L',f'₹{net:,.2f}');st.dataframe(pt,use_container_width=True,hide_index=True);st.download_button('Download paper trades CSV',pt.to_csv(index=False),'paper_trades.csv','text/csv')
+        sl = t1 = t2 = t3 = np.nan
+    return {"signal": signal, "score": score, "confidence": confidence, "reasons": reasons,
+            "entry": entry, "sl": sl, "t1": t1, "t2": t2, "t3": t3, "atr": atr,
+            "rr": f"1:{rr_multiple:g} (T1); T2/T3 are 2x/3x selected RR", "patterns": patterns}
 
-st.subheader('11. Combined Indicator Confirmation')
-macd_state='Bullish' if safe(last.macd)>safe(last.macd_signal) else 'Bearish' if safe(last.macd)<safe(last.macd_signal) else 'Neutral'
-bb_state='Above midline' if safe(last.close)>safe(last.bb_mid) else 'Below midline' if safe(last.close)<safe(last.bb_mid) else 'At midline'
-ema_state='Bullish' if safe(last.ema20)>safe(last.ema50) else 'Bearish' if safe(last.ema20)<safe(last.ema50) else 'Neutral'
-cc=st.columns(4);cc[0].metric('EMA20 / EMA50',ema_state);cc[1].metric('MACD Direction',macd_state);cc[2].metric('Bollinger Position',bb_state);cc[3].metric('Final Combined Signal',signal)
-st.caption('Final signal is a rule-based confluence of technical indicators plus automatic PCR context when available and user-entered news/event context. A BUY/SELL label is not a guarantee or a calibrated probability; use this as an educational/paper-trading dashboard.')
+def calc_backtest(d, cost_bps=10):
+    """Crossover proxy backtest with next-bar returns and estimated costs; not fill-level simulation."""
+    if len(d) < 40:
+        return pd.DataFrame()
+    x = d.copy()
+    x["fast"] = x["Close"].ewm(span=9, adjust=False).mean()
+    x["slow"] = x["Close"].ewm(span=20, adjust=False).mean()
+    x["position"] = np.where(x["fast"] > x["slow"], 1, -1)
+    x["position_prev"] = x["position"].shift(1).fillna(0)
+    x["gross_return"] = x["position_prev"] * x["Close"].pct_change()
+    x["turnover"] = (x["position"] - x["position_prev"]).abs().fillna(0)
+    x["estimated_cost"] = x["turnover"] * (float(cost_bps) / 10000.0)
+    x["net_return"] = x["gross_return"].fillna(0) - x["estimated_cost"]
+    x["equity_curve"] = (1 + x["net_return"]).cumprod()
+    x["drawdown_pct"] = (x["equity_curve"] / x["equity_curve"].cummax() - 1) * 100
+    x["trade_change"] = x["position"].ne(x["position"].shift(1))
+    trades = x.loc[x["trade_change"], ["Close", "position", "gross_return", "estimated_cost", "net_return", "equity_curve", "drawdown_pct"]].copy()
+    trades["P&L % (estimated net, bar proxy)"] = trades["net_return"] * 100
+    trades["Side"] = np.where(trades["position"] > 0, "LONG", "SHORT")
+    return trades.tail(200)
 
-st.subheader('12. Current Data / Signal Caveats')
-st.write('• Angel One mode resolves the instrument master and fetches candles. PCR is attempted through the authenticated SmartAPI endpoint. FII/DII net flows are manual fallback only in this build; live OI-change percentages and automatic news/geopolitical verification are not integrated and remain N/A/manual. Global daily changes use Yahoo Finance and may be delayed.')
-st.write('• “Win chance” is not inferred from score. The backtest win rate is historical for the selected ticker, period and rules and may not predict future results.')
-st.write('• Yahoo ticker coverage varies; some index symbols or intraday intervals may be unavailable. Always verify latest timestamps and use paper trading first.')
-st.caption('For public deployment, change the default login and use secure secrets. This app is not financial advice.')
+def load_journal():
+    if JOURNAL_PATH.exists():
+        try:
+            return pd.read_csv(JOURNAL_PATH)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=["time", "symbol", "side", "entry", "exit", "quantity", "pnl", "notes"])
+
+def save_journal(df):
+    df.to_csv(JOURNAL_PATH, index=False)
+
+
+
+def get_option_chain_snapshot(index_name, spot_price, max_strikes=12):
+    """Fetch a best-effort Angel One NFO option-chain snapshot using FULL market data.
+    Returns rows with OI and polling-based OI change; never fabricates PCR/OI.
+    """
+    client = st.session_state.angel_session
+    master = st.session_state.angel_instruments
+    if client is None:
+        return pd.DataFrame(), "Connect Angel One to load live option-chain OI/PCR."
+    if master is None or master.empty:
+        master = download_instrument_master()
+        st.session_state.angel_instruments = master
+    if master.empty:
+        return pd.DataFrame(), "Could not download Angel One instrument master."
+    lower = {str(c).lower(): c for c in master.columns}
+    needed = ["symbol", "name", "exch_seg", "instrumenttype", "expiry", "strike", "optiontype", "token"]
+    if not all(k in lower for k in needed):
+        return pd.DataFrame(), "Instrument master schema did not include the required option fields."
+    def col(k): return lower[k]
+    frame = master.copy()
+    frame = frame[frame[col("exch_seg")].astype(str).str.upper().eq("NFO")]
+    frame = frame[frame[col("instrumenttype")].astype(str).str.upper().str.contains("OPTIDX", na=False)]
+    names = frame[col("name")].astype(str).str.upper().str.replace(" ", "", regex=False)
+    wanted = "BANKNIFTY" if index_name.upper() == "BANKNIFTY" else "NIFTY"
+    frame = frame[names.eq(wanted)].copy()
+    if frame.empty:
+        return pd.DataFrame(), f"No NFO index options found for {wanted} in the current instrument master."
+    frame["_expiry"] = pd.to_datetime(frame[col("expiry")], errors="coerce")
+    today = pd.Timestamp.now().normalize()
+    frame = frame[frame["_expiry"] >= today]
+    if frame.empty:
+        return pd.DataFrame(), f"No unexpired option contracts found for {wanted}."
+    expiry = frame["_expiry"].min()
+    frame = frame[frame["_expiry"].eq(expiry)].copy()
+    frame["_strike"] = pd.to_numeric(frame[col("strike")], errors="coerce")
+    # Angel One instrument master strike values are often scaled by 100.
+    max_strike = frame["_strike"].max()
+    if pd.notna(max_strike) and max_strike > spot_price * 20:
+        frame["_strike"] = frame["_strike"] / 100.0
+    frame["_otype"] = frame[col("optiontype")].astype(str).str.upper()
+    frame = frame[frame["_otype"].isin(["CE", "PE"])]
+    frame["_distance"] = (frame["_strike"] - float(spot_price)).abs()
+    strikes = sorted(frame.dropna(subset=["_strike"]).drop_duplicates("_strike")["_strike"].tolist(), key=lambda x: abs(x - spot_price))[:max_strikes]
+    frame = frame[frame["_strike"].isin(strikes)].copy()
+    frame = frame.sort_values("_strike")
+    if frame.empty:
+        return pd.DataFrame(), f"No strikes found around {wanted} spot price."
+    # Keep request size bounded for broker API limits.
+    frame = frame.head(50)
+    token_list = frame[col("token")].astype(str).tolist()
+    try:
+        response = client.getMarketData("FULL", {"NFO": token_list})
+        payload = (response or {}).get("data") or {}
+        fetched = payload.get("fetched") or []
+        if not fetched:
+            return pd.DataFrame(), f"Angel One returned no option quotes: {(response or {}).get('message', '')}"
+        quote_by_token = {str(q.get("symbolToken", q.get("token", ""))): q for q in fetched}
+        records = []
+        for _, row in frame.iterrows():
+            token = str(row[col("token")])
+            q = quote_by_token.get(token, {})
+            oi = q.get("opnInterest", q.get("openInterest", q.get("open_interest", np.nan)))
+            ltp = q.get("ltp", np.nan)
+            records.append({
+                "Expiry": str(row["_expiry"].date()),
+                "Strike": float(row["_strike"]),
+                "Type": row["_otype"],
+                "Symbol": str(row[col("symbol")]),
+                "Token": token,
+                "LTP": safe_float(ltp),
+                "OI": safe_float(oi),
+            })
+        result = pd.DataFrame(records)
+        if result.empty or result["OI"].isna().all():
+            return pd.DataFrame(), "Quotes arrived but OI was not included. Check Angel One market-data API permissions/response."
+        now = datetime.now()
+        cache_key = f"oi_{index_name}"
+        history = st.session_state.get(cache_key, [])
+        previous = history[-1]["quotes"] if history else {}
+        result["Change in OI"] = result.apply(
+            lambda r: r["OI"] - previous.get(r["Token"], r["OI"]) if pd.notna(r["OI"]) else np.nan, axis=1
+        )
+        quote_map = {r["Token"]: r["OI"] for _, r in result.iterrows() if pd.notna(r["OI"])}
+        history.append({"time": now, "quotes": quote_map})
+        history = [h for h in history if now - h["time"] <= timedelta(minutes=20)]
+        st.session_state[cache_key] = history
+        result.attrs["history"] = history
+        return result, f"Angel One option quotes · expiry {expiry.date()} · OI change is since the previous successful refresh."
+    except Exception as exc:
+        return pd.DataFrame(), f"Angel One option quote request failed: {exc}"
+
+
+def render_option_panel(index_name, spot_price):
+    st.markdown(f"#### INTRADAY DATA — {index_name}")
+    interval_label = st.radio(
+        f"{index_name} interval", ["3 mins", "5 mins", "15 mins"],
+        horizontal=True, key=f"oi_interval_{index_name}"
+    )
+    chain, note = get_option_chain_snapshot(index_name, spot_price)
+    if chain.empty:
+        st.info(note)
+        st.caption("PCR/OI values are intentionally left unavailable until verified option-chain data is returned; they are not estimated from stock prices.")
+        return
+    call_oi = chain.loc[chain["Type"].eq("CE"), "OI"].sum(min_count=1)
+    put_oi = chain.loc[chain["Type"].eq("PE"), "OI"].sum(min_count=1)
+    pcr = (put_oi / call_oi) if pd.notna(call_oi) and call_oi > 0 and pd.notna(put_oi) else np.nan
+    call_chg = chain.loc[chain["Type"].eq("CE"), "Change in OI"].sum(min_count=1)
+    put_chg = chain.loc[chain["Type"].eq("PE"), "Change in OI"].sum(min_count=1)
+    oi_diff = put_chg - call_chg if pd.notna(put_chg) and pd.notna(call_chg) else np.nan
+    # Conservative heuristic; not a standalone option recommendation.
+    if pd.notna(pcr) and pd.notna(oi_diff):
+        option_signal = "BUY" if pcr >= 1.15 and oi_diff > 0 else "SELL" if pcr <= 0.85 and oi_diff < 0 else "WAIT"
+    else:
+        option_signal = "WAIT"
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Spot reference", f"{spot_price:,.2f}" if spot_price else "N/A")
+    c2.metric("PCR (displayed strikes)", f"{pcr:.2f}" if pd.notna(pcr) else "N/A")
+    c3.metric("Net OI change (PE−CE)", f"{oi_diff:,.0f}" if pd.notna(oi_diff) else "N/A")
+    c4.metric("Option signal", option_signal)
+    st.caption(note + f" Selected view: {interval_label}. This is a snapshot collected when the app refreshes; it is not historical data from before the app was running.")
+    # Keep a session-local time series of verified snapshots, labelled by the selected interval.
+    snap_key = f"pcr_snapshots_{index_name}"
+    snapshots = st.session_state.get(snap_key, [])
+    snapshot = {"Time": datetime.now().strftime("%H:%M:%S"), "View": interval_label,
+                "PCR": round(float(pcr), 3) if pd.notna(pcr) else np.nan,
+                "Call OI": float(call_oi) if pd.notna(call_oi) else np.nan,
+                "Put OI": float(put_oi) if pd.notna(put_oi) else np.nan,
+                "Net OI change (PE−CE)": float(oi_diff) if pd.notna(oi_diff) else np.nan,
+                "Option signal": option_signal}
+    if not snapshots or snapshots[-1].get("Time") != snapshot["Time"]:
+        snapshots.append(snapshot)
+    st.session_state[snap_key] = snapshots[-200:]
+    view = chain[["Strike", "Type", "LTP", "OI", "Change in OI"]].copy()
+    view["LTP"] = view["LTP"].map(lambda x: round(x, 2) if pd.notna(x) else np.nan)
+    st.dataframe(view, use_container_width=True, hide_index=True)
+    history = st.session_state.get(f"oi_{index_name}", [])
+    if len(history) >= 2:
+        hist_df = pd.DataFrame([{"Time": h["time"].strftime("%H:%M:%S"), "Tokens with OI": len(h["quotes"])} for h in history])
+        st.caption("Captured quote refresh history (current app session)")
+        st.dataframe(hist_df.tail(10), use_container_width=True, hide_index=True)
+    snapshots_df = pd.DataFrame(st.session_state.get(f"pcr_snapshots_{index_name}", []))
+    if not snapshots_df.empty:
+        st.markdown("**Time-wise PCR / OI signal history (captured since app opened)**")
+        st.dataframe(snapshots_df.tail(20).iloc[::-1], use_container_width=True, hide_index=True)
+
+
+def _angel_nearest_future_change(underlying_name):
+    """Return nearest-expiry Angel One futures LTP and % change, or N/A when unavailable."""
+    client = st.session_state.get("angel_session")
+    master = st.session_state.get("angel_instruments")
+    if client is None:
+        return np.nan, np.nan
+    if master is None or master.empty:
+        master = download_instrument_master()
+        st.session_state.angel_instruments = master
+    if master.empty:
+        return np.nan, np.nan
+    lower = {str(c).lower(): c for c in master.columns}
+    required = ["symbol", "name", "exch_seg", "instrumenttype", "expiry", "token"]
+    if not all(k in lower for k in required):
+        return np.nan, np.nan
+    col = lambda k: lower[k]
+    frame = master.copy()
+    frame = frame[frame[col("exch_seg")].astype(str).str.upper().eq("NFO")]
+    frame = frame[frame[col("instrumenttype")].astype(str).str.upper().str.contains("FUT", na=False)]
+    frame = frame[frame[col("name")].astype(str).str.upper().str.replace(" ", "", regex=False).eq(underlying_name.upper().replace(" ", ""))]
+    frame["_expiry"] = pd.to_datetime(frame[col("expiry")], errors="coerce")
+    frame = frame[frame["_expiry"] >= pd.Timestamp.now().normalize()].sort_values("_expiry")
+    if frame.empty:
+        return np.nan, np.nan
+    row = frame.iloc[0]
+    try:
+        response = client.getMarketData("FULL", {"NFO": [str(row[col("token")])]})
+        payload = (response or {}).get("data") or {}
+        quotes = payload.get("fetched") or []
+        if not quotes:
+            return np.nan, np.nan
+        quote = quotes[0]
+        ltp = safe_float(quote.get("ltp"))
+        previous_close = safe_float(quote.get("close", quote.get("closePrice", np.nan)))
+        change = (ltp / previous_close - 1) * 100 if pd.notna(ltp) and pd.notna(previous_close) and previous_close else np.nan
+        return ltp, change
+    except Exception:
+        return np.nan, np.nan
+
+
+def render_stock_scanner():
+    st.subheader("📉 Major Stocks Strength Scanner — CMP & % Change")
+    st.caption("Spot % change is shown from the latest available candle versus the previous daily close. Futures % change is shown only when Angel One returns a valid nearest-expiry futures quote; otherwise it stays N/A.")
+    stocks = [
+        ("HDFC BANK", "HDFCBANK.NS", "HDFCBANK"), ("RELIANCE", "RELIANCE.NS", "RELIANCE"),
+        ("ICICI BANK", "ICICIBANK.NS", "ICICIBANK"), ("INFY", "INFY.NS", "INFY"),
+        ("LT", "LT.NS", "LT"), ("TCS", "TCS.NS", "TCS"), ("ITC", "ITC.NS", "ITC"),
+        ("BHARTI AIRTEL", "BHARTIARTL.NS", "BHARTIARTL"), ("AXIS BANK", "AXISBANK.NS", "AXISBANK"),
+        ("SBI", "SBIN.NS", "SBIN"),
+    ]
+    rows = []
+    for name, ticker, angel_name in stocks:
+        daily = get_yahoo_history(ticker, period="5d", interval="1d")
+        intraday = get_yahoo_history(ticker, period="5d", interval="5m")
+        history = intraday if not intraday.empty else daily
+        cmp = float(history["Close"].iloc[-1]) if not history.empty else np.nan
+        prev_close = float(daily["Close"].iloc[-2]) if len(daily) >= 2 else np.nan
+        spot_change = (cmp / prev_close - 1) * 100 if pd.notna(cmp) and pd.notna(prev_close) and prev_close else np.nan
+        fut_cmp, fut_change = _angel_nearest_future_change(angel_name)
+        rows.append({"S.NO": len(rows)+1, "STOCKS": name, "CMP (Spot)": cmp,
+                     "Spot % Change": spot_change, "Futures CMP": fut_cmp,
+                     "%chg fut": fut_change,
+                     "Strength": "BULLISH" if pd.notna(spot_change) and spot_change > 0 else "BEARISH" if pd.notna(spot_change) and spot_change < 0 else "N/A"})
+    table = pd.DataFrame(rows)
+    def color_change(value):
+        if pd.isna(value): return ""
+        return "background-color: #8bd34f; color: black" if value >= 0 else "background-color: #ff2424; color: white"
+    st.dataframe(table.style.format({"CMP (Spot)": "{:.2f}", "Spot % Change": "{:+.2f}%", "Futures CMP": "{:.2f}", "%chg fut": "{:+.2f}%"}, na_rep="N/A")
+                 .map(color_change, subset=["Spot % Change", "%chg fut"]), use_container_width=True, hide_index=True)
+    if st.session_state.get("angel_session") is None:
+        st.caption("Connect Angel One to populate actual futures quotes. Yahoo spot movement is not represented as futures movement.")
+
+def market_cards(title, items):
+    st.subheader(title)
+    cols = st.columns(min(4, len(items)))
+    for i, (name, ticker) in enumerate(items.items()):
+        with cols[i % len(cols)]:
+            data = get_yahoo_history(ticker, period="5d", interval="1d")
+            if not data.empty and len(data) >= 2:
+                last = float(data["Close"].iloc[-1])
+                prev = float(data["Close"].iloc[-2])
+                change = (last / prev - 1) * 100 if prev else 0
+                st.metric(name, f"{last:,.2f}", f"{change:+.2f}%")
+            else:
+                st.metric(name, "N/A", "Data unavailable")
+
+st.title("📈 Trading Intelligence Terminal")
+st.caption("Research and paper-trading dashboard. Signals are rule-based, not guaranteed; verify data and risk before any real order.")
+
+with st.sidebar:
+    st.header("⚙️ Settings")
+    source = st.selectbox("Market data source", ["Yahoo Finance", "Angel One", "Demo (synthetic)"])
+    st.session_state.source = source
+    symbol_label = st.selectbox("Instrument", list(INDIAN_WATCHLIST.keys()))
+    symbol = INDIAN_WATCHLIST[symbol_label]
+    interval_label = st.selectbox("Chart timeframe", ["1 minute", "3 minutes", "5 minutes", "15 minutes", "Daily"], index=2)
+    yahoo_interval = {"1 minute": "1m", "3 minutes": "5m", "5 minutes": "5m", "15 minutes": "15m", "Daily": "1d"}[interval_label]
+    angel_interval = {"1 minute": "ONE_MINUTE", "3 minutes": "THREE_MINUTE", "5 minutes": "FIVE_MINUTE", "15 minutes": "FIFTEEN_MINUTE", "Daily": "ONE_DAY"}[interval_label]
+    rr_choice = st.selectbox("Target 1 Risk:Reward", [1, 2, 3, 5], index=1, format_func=lambda x: f"1:{x}")
+    refresh_enabled = st.toggle("Auto-refresh", value=False)
+    refresh_seconds = st.selectbox("Refresh interval", [5, 10, 15, 30, 60], index=2)
+    st.session_state.refresh_on = refresh_enabled
+    if refresh_enabled:
+        st_autorefresh(interval=refresh_seconds * 1000, key="market_refresh")
+    st.divider()
+    st.subheader("Angel One connection")
+    st.caption("Credentials stay in this Streamlit session. Never share API secrets or deploy them in public code.")
+    if not SMARTAPI_AVAILABLE:
+        st.warning("SmartAPI package not loaded. Yahoo/demo mode is available.")
+    st.text_input("API Key", key="angel_api", type="password")
+    st.text_input("Client Code", key="angel_client")
+    st.text_input("PIN", key="angel_pin", type="password")
+    st.text_input("TOTP secret (not the 6-digit OTP)", key="angel_totp", type="password")
+    if st.button("Connect Angel One", use_container_width=True):
+        try:
+            with st.spinner("Connecting to Angel One..."):
+                connect_angel()
+            st.success("Angel One session connected.")
+        except Exception as exc:
+            st.session_state.angel_status = "Connection failed"
+            st.error(str(exc))
+    st.caption(f"Status: {st.session_state.angel_status}")
+    if st.button("Refresh instrument master", use_container_width=True):
+        download_instrument_master.clear()
+        st.session_state.angel_instruments = download_instrument_master()
+        st.info(f"Instrument master rows: {len(st.session_state.angel_instruments)}")
+
+if source == "Angel One":
+    with st.spinner("Loading Angel One candles..."):
+        candles, data_note = get_angel_history(symbol, angel_interval)
+    if candles.empty:
+        st.warning(data_note)
+        st.info("Use Yahoo Finance temporarily, or check the Angel One login, API permissions, market hours and instrument availability.")
+        data = get_yahoo_history(symbol, period="5d", interval=yahoo_interval)
+        actual_source = "Yahoo fallback"
+    else:
+        data, actual_source = candles, data_note
+elif source == "Demo (synthetic)":
+    idx = pd.date_range(end=pd.Timestamp.now().floor("min"), periods=300, freq="5min")
+    rng = np.random.default_rng(42)
+    close = 22000 + np.cumsum(rng.normal(0, 22, len(idx)))
+    op = np.r_[close[0], close[:-1]]
+    data = pd.DataFrame({"Open": op, "High": np.maximum(op, close) + rng.uniform(1, 12, len(idx)),
+                         "Low": np.minimum(op, close) - rng.uniform(1, 12, len(idx)),
+                         "Close": close, "Volume": rng.integers(1000, 15000, len(idx))}, index=idx)
+    actual_source = "Synthetic demo data — not live"
+else:
+    period = "60d" if yahoo_interval in ["1d", "15m"] else "5d"
+    data = get_yahoo_history(symbol, period=period, interval=yahoo_interval)
+    actual_source = "Yahoo Finance"
+
+if data.empty:
+    st.error("No candles received for this instrument/timeframe. Try another symbol, timeframe, or data source.")
+    st.stop()
+
+d = add_indicators(data)
+signal = analyze_signal(d, rr_multiple=rr_choice)
+last = d.iloc[-1]
+st.caption(f"Selected: **{symbol_label}** · Data source: **{actual_source}** · Last candle: {d.index[-1]}")
+
+# Global / Indian market snapshot
+with st.expander("🌍 Global markets and macro instruments", expanded=True):
+    market_cards("Global / macro performance (latest daily close)", GLOBAL_WATCHLIST)
+with st.expander("🇮🇳 Major Indian stocks — Banks, IT, Auto and index leaders", expanded=True):
+    market_cards("Indian market performance (latest daily close)", {k:v for k,v in INDIAN_WATCHLIST.items() if k not in ["NIFTY 50", "BANK NIFTY", "SENSEX"]})
+
+render_stock_scanner()
+
+st.subheader("🧭 NIFTY & BANKNIFTY — Option Chain / Intraday OI")
+idx1, idx2 = st.columns(2)
+with idx1:
+    nifty_hist = get_yahoo_history("^NSEI", period="5d", interval="5m")
+    nifty_spot = float(nifty_hist["Close"].iloc[-1]) if not nifty_hist.empty else 0.0
+    render_option_panel("NIFTY", nifty_spot)
+with idx2:
+    bank_hist = get_yahoo_history("^NSEBANK", period="5d", interval="5m")
+    bank_spot = float(bank_hist["Close"].iloc[-1]) if not bank_hist.empty else 0.0
+    render_option_panel("BANKNIFTY", bank_spot)
+
+st.divider()
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Last price", f"{last['Close']:,.2f}")
+m2.metric("Signal", signal["signal"], f"Score {signal['score']:+d}")
+m3.metric("RSI (14)", f"{last['RSI']:.1f}" if pd.notna(last["RSI"]) else "N/A")
+m4.metric("ADX (14)", f"{last['ADX']:.1f}" if pd.notna(last["ADX"]) else "N/A")
+m5.metric("Volume / avg", f"{last['Vol_Ratio']:.2f}x" if pd.notna(last["Vol_Ratio"]) else "N/A")
+
+if signal["signal"] != "WAIT":
+    a, b, c, e, f = st.columns(5)
+    a.metric("Entry reference", f"{signal['entry']:,.2f}")
+    b.metric("Stop loss", f"{signal['sl']:,.2f}")
+    c.metric("Target 1", f"{signal['t1']:,.2f}")
+    e.metric("Target 2", f"{signal['t2']:,.2f}")
+    f.metric("Target 3", f"{signal['t3']:,.2f}")
+    st.caption(f"Selected target RR: {signal['rr']}. ATR-based reference levels only; these are not broker orders and do not account for slippage, charges, gaps or liquidity.")
+else:
+    st.info("Current combined score is mixed. WAIT is not a trade recommendation.")
+
+left, right = st.columns([2, 1])
+with left:
+    st.subheader("Candlestick chart + EMA + Bollinger Bands")
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Candles"))
+    for col, name in [("EMA9","EMA 9"), ("EMA20","EMA 20"), ("EMA50","EMA 50"), ("BB_Upper","BB Upper"), ("BB_Lower","BB Lower"), ("VWAP","VWAP")]:
+        fig.add_trace(go.Scatter(x=d.index, y=d[col], mode="lines", name=name))
+    fig.update_layout(height=580, xaxis_rangeslider_visible=False, legend_orientation="h", margin=dict(l=10,r=10,t=30,b=10))
+    # Annotate every detected candle pattern on chart; multi-candle patterns label the confirmation candle.
+    pa = add_price_action_columns(d)
+    marked = pa[pa["Pattern"].astype(str).str.len() > 0]
+    if not marked.empty:
+        fig.add_trace(go.Scatter(x=marked.index, y=marked["High"] * 1.002,
+            mode="markers+text", text=marked["Pattern"].str.slice(0, 38), textposition="top center",
+            marker=dict(symbol="diamond", size=7), name="Candlestick patterns",
+            hovertemplate="Time: %{x}<br>Pattern: %{text}<extra></extra>"))
+    fig.update_layout(hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Pattern labels are heuristic; some patterns need trend/context confirmation. Multi-candle patterns are labelled on their confirmation candle.")
+with right:
+    st.subheader("Combined signal checks")
+    for item in signal.get("reasons", []):
+        st.write(("🟢 " if "above" in item.lower() or "bullish" in item.lower() else "⚪ ") + item)
+    st.subheader("Candlestick patterns")
+    for pattern in signal.get("patterns", []):
+        st.write("• " + pattern)
+    st.metric("Rule-score strength (not win probability)", f"{signal.get('confidence', 0)}%")
+    st.caption("This percentage is a normalized indicator score, not a tested probability of winning a trade.")
+    st.write(f"**Trend:** {'Bullish' if signal['score'] >= 3 else 'Bearish' if signal['score'] <= -3 else 'Sideways / mixed'}")
+    st.write(f"**Support (rolling 20):** {last['Support']:.2f}" if pd.notna(last["Support"]) else "Support: N/A")
+    st.write(f"**Resistance (rolling 20):** {last['Resistance']:.2f}" if pd.notna(last["Resistance"]) else "Resistance: N/A")
+    st.write(f"**Previous pivot:** {last['Pivot']:.2f}" if pd.notna(last["Pivot"]) else "Pivot: N/A")
+    st.write(f"**Previous candle high / low:** {last['Previous High']:.2f} / {last['Previous Low']:.2f}" if pd.notna(last["Previous High"]) and pd.notna(last["Previous Low"]) else "Previous candle high/low: N/A")
+
+st.subheader("🕯️ Candle-by-Candle Candlestick Pattern & Price Action")
+pa_all = add_price_action_columns(d)
+show_n = st.selectbox("Candles to inspect", [20, 50, 100, 200], index=1, key="candle_rows")
+pa_view = pa_all.tail(show_n).copy()
+pa_view.insert(0, "Time", pa_view.index.astype(str))
+cols = ["Time", "Open", "High", "Low", "Close", "Candle Type", "Body", "Upper Wick", "Lower Wick", "Body %", "Pattern", "Price Action", "Structure", "Volume Status", "VWAP Position"]
+st.dataframe(pa_view[cols].sort_values("Time", ascending=False), use_container_width=True, hide_index=True)
+st.caption("BOS labels use a simple rolling 10-candle high/low break. CHoCH/liquidity sweeps are not asserted without a swing-point confirmation algorithm; pattern names such as 'candidate' require context and are not standalone trade signals.")
+
+st.subheader("Momentum and volume")
+ind1, ind2 = st.columns(2)
+with ind1:
+    fig_rsi = go.Figure()
+    fig_rsi.add_trace(go.Scatter(x=d.index, y=d["RSI"], name="RSI"))
+    fig_rsi.add_hline(y=70, line_dash="dash")
+    fig_rsi.add_hline(y=30, line_dash="dash")
+    fig_rsi.update_layout(height=260, title="RSI (14)", yaxis_range=[0,100])
+    st.plotly_chart(fig_rsi, use_container_width=True)
+with ind2:
+    fig_macd = go.Figure()
+    fig_macd.add_trace(go.Scatter(x=d.index, y=d["MACD"], name="MACD"))
+    fig_macd.add_trace(go.Scatter(x=d.index, y=d["MACD_Signal"], name="Signal"))
+    fig_macd.update_layout(height=260, title="MACD")
+    st.plotly_chart(fig_macd, use_container_width=True)
+
+st.subheader("Timeframe / trend context")
+mtf_cols = st.columns(3)
+for col, (label, interval, period) in zip(mtf_cols, [("1-minute", "1m", "1d"), ("5-minute", "5m", "5d"), ("15-minute", "15m", "5d")]):
+    with col:
+        mtf = get_yahoo_history(symbol, period=period, interval=interval)
+        if not mtf.empty and len(mtf) >= 20:
+            fast = mtf["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
+            slow = mtf["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
+            st.metric(label, "Bullish" if fast > slow else "Bearish", f"Close {mtf['Close'].iloc[-1]:,.2f}")
+        else:
+            st.metric(label, "N/A", "Data unavailable")
+
+st.subheader("📊 Backtest (EMA 9/20 crossover proxy with estimated costs)")
+cost_bps = st.number_input("Estimated cost per position change (basis points)", min_value=0.0, max_value=100.0, value=10.0, step=1.0, help="Approximate total costs/slippage assumption. Actual charges vary by instrument and broker.")
+bt = calc_backtest(d, cost_bps=cost_bps)
+if bt.empty:
+    st.info("Not enough historical candles for this backtest.")
+else:
+    returns = bt["P&L % (estimated net, bar proxy)"].dropna()
+    wins = int((returns > 0).sum())
+    losses = int((returns < 0).sum())
+    total = len(returns)
+    win_rate = (wins / total * 100) if total else 0
+    gross_net_pct = (float((1 + bt["net_return"].fillna(0)).prod()) - 1) * 100
+    positive_sum = returns[returns > 0].sum()
+    negative_sum = abs(returns[returns < 0].sum())
+    profit_factor = positive_sum / negative_sum if negative_sum > 0 else np.nan
+    max_dd = float(bt["drawdown_pct"].min()) if not bt["drawdown_pct"].empty else 0.0
+    b1,b2,b3,b4,b5 = st.columns(5)
+    b1.metric("Signal changes", total)
+    b2.metric("Positive rows", wins)
+    b3.metric("Negative rows", losses)
+    b4.metric("Positive-row ratio", f"{win_rate:.1f}%")
+    b5.metric("Max drawdown (proxy)", f"{max_dd:.2f}%")
+    st.metric("Compounded net return (proxy)", f"{gross_net_pct:.2f}%", f"Profit factor: {profit_factor:.2f}" if pd.notna(profit_factor) else "Profit factor: N/A")
+    st.caption("Educational proxy, not fill-level backtesting. It does not simulate candle-by-candle stop/target fills, realistic position sizing, taxes, funding, market impact or gaps. Past results do not predict future returns.")
+    st.dataframe(bt.tail(30), use_container_width=True)
+
+st.subheader("🧾 Paper trading — no real orders are sent")
+p1,p2,p3 = st.columns(3)
+with p1:
+    qty = st.number_input("Quantity", min_value=1, value=1, step=1)
+with p2:
+    st.metric("Paper cash", f"₹{st.session_state.paper_cash:,.2f}")
+with p3:
+    st.metric("Realized paper P&L", f"₹{st.session_state.paper_realized:,.2f}")
+
+pos = st.session_state.paper_position
+if pos:
+    st.info(f"Open paper position: {pos['side']} {pos['qty']} × {pos['symbol']} @ {pos['entry']:.2f}")
+    current_pnl = (last["Close"] - pos["entry"]) * pos["qty"] * (1 if pos["side"] == "BUY" else -1)
+    st.metric("Unrealized paper P&L", f"₹{current_pnl:,.2f}")
+    if st.button("Close paper position"):
+        exit_price = float(last["Close"])
+        pnl = (exit_price - pos["entry"]) * pos["qty"] * (1 if pos["side"] == "BUY" else -1)
+        journal = load_journal()
+        row = {"time": datetime.now().isoformat(timespec="seconds"), "symbol": pos["symbol"], "side": pos["side"],
+               "entry": pos["entry"], "exit": exit_price, "quantity": pos["qty"], "pnl": pnl, "notes": "Paper close"}
+        journal = pd.concat([journal, pd.DataFrame([row])], ignore_index=True)
+        save_journal(journal)
+        st.session_state.paper_realized += pnl
+        st.session_state.paper_position = None
+        st.rerun()
+else:
+    buy_col, sell_col = st.columns(2)
+    with buy_col:
+        if st.button("Open paper BUY", use_container_width=True):
+            st.session_state.paper_position = {"side": "BUY", "symbol": symbol_label, "entry": float(last["Close"]), "qty": int(qty)}
+            st.rerun()
+    with sell_col:
+        if st.button("Open paper SELL", use_container_width=True):
+            st.session_state.paper_position = {"side": "SELL", "symbol": symbol_label, "entry": float(last["Close"]), "qty": int(qty)}
+            st.rerun()
+
+st.subheader("Trade journal")
+journal = load_journal()
+if not journal.empty:
+    wins_j = int((pd.to_numeric(journal["pnl"], errors="coerce") > 0).sum())
+    closed = len(journal)
+    j1,j2,j3 = st.columns(3)
+    j1.metric("Closed paper trades", closed)
+    j2.metric("Winning trades", wins_j)
+    j3.metric("Journal win rate", f"{wins_j/closed*100:.1f}%" if closed else "N/A")
+    st.dataframe(journal.tail(100), use_container_width=True)
+    st.download_button("Download trade journal CSV", journal.to_csv(index=False).encode("utf-8"), "trade_journal.csv", "text/csv")
+else:
+    st.caption("No closed paper trades yet. Paper trades are stored in trade_journal.csv beside app.py.")
+
+with st.expander("Data availability notes / features not falsely estimated"):
+    st.markdown("""
+- **Angel One tokens:** the app downloads the public instrument master and tries to resolve symbols automatically. Some symbols/derivative contracts can still require mapping depending on the current instrument master.
+- **Live data:** refresh is polling, not a guaranteed zero-delay feed. Yahoo intraday history can be delayed, restricted, or unavailable. Angel One candle data depends on broker API access and rate limits.
+- **PCR / option-chain OI:** displayed only when Angel One returns option quotes with OI. Time-wise PCR/OI rows are captured from the moment the app is open and refreshes; historical snapshots from before launch are not available. FII/DII flows and official event/news feeds are not included.
+- **Real orders:** deliberately not implemented. Paper-trading buttons only record simulated positions. No actual Angel One order is placed by this app.
+- **Login:** basic session login is included. Configure APP_USERNAME and APP_PASSWORD in Streamlit secrets/environment and change the default demo credentials before public deployment.
+- **Win chance:** a real probability requires out-of-sample validation. The displayed score strength is not a calibrated win probability.
+""")
+st.caption(f"Updated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · For education/research only; not investment advice.")
