@@ -146,6 +146,24 @@ def find_angel_token(symbol, exchange="NSE"):
     The public instrument master commonly uses `token` (not `symboltoken`),
     so support both schemas and prefer exact/index matches over derivatives.
     """
+    raw = str(symbol).strip().upper()
+    # Prefer the documented SmartAPI index tokens for well-known index tickers.
+    # Resolving an index by fuzzy master-file text matching can accidentally pick
+    # a similarly named row, which makes every MTF request look connected but wrong.
+    known_index_tokens = {
+        "^NSEI": ("99926000", "Nifty 50", "NSE"),
+        "NSEI": ("99926000", "Nifty 50", "NSE"),
+        "^NSEBANK": ("99926009", "Nifty Bank", "NSE"),
+        "NSEBANK": ("99926009", "Nifty Bank", "NSE"),
+        "^BSESN": ("99919000", "SENSEX", "BSE"),
+        "BSESN": ("99919000", "SENSEX", "BSE"),
+    }
+    if raw in known_index_tokens:
+        token, trading_symbol, fixed_exchange = known_index_tokens[raw]
+        # Caller uses the exchange returned by the symbol's known mapping.
+        st.session_state["_angel_last_resolved_exchange"] = fixed_exchange
+        return token, trading_symbol
+
     master = st.session_state.get("angel_instruments")
     if master is None or master.empty:
         master = download_instrument_master()
@@ -162,7 +180,6 @@ def find_angel_token(symbol, exchange="NSE"):
     if token_col is None or exch_col is None or tsym_col is None:
         return None
 
-    raw = str(symbol).strip().upper()
     # Index labels on Yahoo Finance do not match Angel One's trading symbols.
     aliases = {
         "^NSEI": ["NIFTY 50", "NIFTY50", "NIFTY"],
@@ -275,8 +292,12 @@ def get_angel_history(symbol, interval="FIVE_MINUTE", exchange="NSE"):
         exchange = "BSE"
     resolved = find_angel_token(symbol, exchange)
     if not resolved:
-        return pd.DataFrame(), f"Could not auto-resolve Angel One token for {symbol}. Try selecting its exact exchange symbol."
+        return pd.DataFrame(), f"Could not auto-resolve Angel One token for {symbol} on {exchange}. Try selecting its exact exchange symbol."
     token, trading_symbol = resolved
+    exchange = st.session_state.get("_angel_last_resolved_exchange", exchange)
+    # Prevent a previous index's remembered exchange from leaking into stock requests.
+    if str(symbol).strip().upper() not in ("^NSEI", "NSEI", "^NSEBANK", "NSEBANK", "^BSESN", "BSESN"):
+        exchange = "NSE" if str(exchange).upper() not in ("NSE", "BSE", "NFO", "BFO") else exchange
     to_dt = datetime.now()
     from_dt = to_dt - timedelta(days=5)
     params = {
@@ -1183,6 +1204,7 @@ for _label, _angel_tf, _yahoo_interval, _period in _mtf_display_plan:
         "Open": f"{_open:,.2f}" if np.isfinite(_open) else "N/A",
         "Close": f"{_close:,.2f}" if np.isfinite(_close) else "N/A",
         "Trend": _trend,
+        "Data Source": ("Angel One API" if source == "Angel One" and actual_source != "Yahoo fallback" else "Yahoo fallback" if source == "Angel One" else actual_source),
     })
 # Guard against a frozen/mis-mapped feed: if every timeframe reports the exact
 # same Open and Close, and each candle is itself flat, this is not trustworthy
@@ -1207,11 +1229,21 @@ if _mtf_feed_suspect:
         _r["Close"] = "N/A — feed check"
         _r["Trend"] = "Unverified feed"
     st.error(
-        "MTF data quality warning: 3 or more timeframes returned the same flat Open/Close. "
-        "This looks like stale, mis-mapped, or non-updating source data; these values are "
-        "not being treated as valid MTF confirmation. Check the selected symbol and data source, "
-        "and verify Angel One candle API responses."
+        f"MTF data quality warning for {symbol_label} ({symbol}): 3 or more timeframes returned the same flat Open/Close. "
+        "These values are NOT valid MTF confirmation. Check the Data Source column below. "
+        "If it says Angel One API, the broker candle endpoint is returning suspiciously identical OHLC; "
+        "if it says Yahoo fallback, the selected chart is not currently using Angel One candles."
     )
+    if source == "Angel One":
+        with st.expander("Angel One MTF diagnostics", expanded=True):
+            st.write({
+                "selected_symbol": symbol,
+                "selected_label": symbol_label,
+                "chart_source": actual_source,
+                "requested_exchange": "BSE" if str(symbol).upper() in ("^BSESN", "BSESN") else "NSE",
+                "intervals_requested": [r["Timeframe"] for r in _mtf_rows],
+                "note": "Each timeframe is requested separately from getCandleData. Review the per-timeframe warnings above for API rejection, empty rows, or token resolution failures.",
+            })
 _mtf_table = pd.DataFrame(_mtf_rows)
 st.dataframe(_mtf_table, use_container_width=True, hide_index=True)
 _bull_tf = 0 if _mtf_feed_suspect else sum(r["Trend"] == "Bullish" for r in _mtf_rows)
