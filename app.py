@@ -284,6 +284,15 @@ def add_indicators(df):
     if df.empty:
         return df
     d = df.copy()
+    # Normalize OHLCV defensively. Some index feeds omit Volume or send it as
+    # strings/NaN; never allow those cases to manufacture a VWAP of 0.00.
+    for _col in ("Open", "High", "Low", "Close"):
+        if _col not in d.columns:
+            d[_col] = np.nan
+        d[_col] = pd.to_numeric(d[_col], errors="coerce")
+    if "Volume" not in d.columns:
+        d["Volume"] = np.nan
+    d["Volume"] = pd.to_numeric(d["Volume"], errors="coerce")
     close, high, low, volume = d["Close"], d["High"], d["Low"], d["Volume"].fillna(0)
     d["EMA9"] = close.ewm(span=9, adjust=False).mean()
     d["EMA20"] = close.ewm(span=20, adjust=False).mean()
@@ -317,20 +326,31 @@ def add_indicators(df):
     # Never substitute a price-only average and call it VWAP. Reset accumulation each
     # calendar session when the candle index is datetime-like. If the feed has no
     # usable positive volume, VWAP remains NaN and the UI reports it as unavailable.
-    vol = pd.to_numeric(d["Volume"], errors="coerce").fillna(0).clip(lower=0)
-    pv = typical * vol
+    vol = pd.to_numeric(d["Volume"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0)
+    # Exclude rows without valid prices from the numerator, and only calculate
+    # VWAP where cumulative traded volume is positive. VWAP resets by trading day.
+    typical = typical.where(np.isfinite(typical) & (typical > 0), np.nan)
+    usable_vol = vol.where(typical.notna(), 0.0)
+    pv = typical.fillna(0.0) * usable_vol
     try:
         idx = pd.to_datetime(d.index, errors="raise")
         session_key = pd.Series(idx.date, index=d.index)
         cum_pv = pv.groupby(session_key).cumsum()
-        cum_vol = vol.groupby(session_key).cumsum()
+        cum_vol = usable_vol.groupby(session_key).cumsum()
     except Exception:
         # For non-datetime indexes, use the available series as one session.
         cum_pv = pv.cumsum()
-        cum_vol = vol.cumsum()
-    d["VWAP"] = cum_pv / cum_vol.where(cum_vol > 0, np.nan)
+        cum_vol = usable_vol.cumsum()
+    _vwap = cum_pv / cum_vol.where(cum_vol > 0, np.nan)
+    # Guard against zero/invalid prices or zero-volume feed rows. Never display
+    # a default 0.00 or replace actual VWAP with a price-only proxy.
+    d["VWAP"] = _vwap.where(np.isfinite(_vwap) & (_vwap > 0), np.nan)
     d["VWAP_Is_Proxy"] = False
-    d["VWAP_Status"] = np.where(cum_vol > 0, "TRUE VWAP", "UNAVAILABLE: no positive volume")
+    d["VWAP_Status"] = np.where(
+        cum_vol > 0,
+        np.where(d["VWAP"].notna(), "TRUE VWAP", "UNAVAILABLE: invalid OHLC/volume"),
+        "UNAVAILABLE: feed has no positive traded volume (common for spot indices)",
+    )
     d["Vol_Avg20"] = volume.rolling(20).mean()
     d["Vol_Ratio"] = volume / d["Vol_Avg20"].replace(0, np.nan)
     plus_dm = high.diff()
@@ -660,8 +680,10 @@ def get_option_chain_snapshot(index_name, spot_price, max_strikes=12):
             symbol_key = str(row[col("symbol")]).strip().upper()
             q = quote_by_token.get(token) or quote_by_symbol.get(symbol_key) or {}
             # Accept SmartAPI aliases; parse numeric strings safely and preserve missing as NaN.
-            oi_raw = next((q[k] for k in ("opninterest", "openinterest", "open_interest", "openinterestvalue", "oi") if k in q and q[k] not in (None, "")), np.nan)
+            oi_raw = next((q[k] for k in ("opninterest", "openinterest", "open_interest", "openinterestvalue", "oi", "openint", "openintvalue", "totalopeninterest") if k in q and q[k] not in (None, "")), np.nan)
             ltp_raw = next((q[k] for k in ("ltp", "lasttradedprice", "last_traded_price") if k in q and q[k] not in (None, "")), np.nan)
+            if isinstance(oi_raw, str):
+                oi_raw = oi_raw.replace(",", "").strip()
             oi = pd.to_numeric(pd.Series([oi_raw]), errors="coerce").iloc[0]
             ltp = safe_float(ltp_raw)
             records.append({
@@ -727,8 +749,12 @@ def render_option_panel(index_name, spot_price):
     call_oi = chain.loc[chain["Type"].eq("CE"), "OI"].sum(min_count=1)
     put_oi = chain.loc[chain["Type"].eq("PE"), "OI"].sum(min_count=1)
     pcr = (put_oi / call_oi) if pd.notna(call_oi) and call_oi > 0 and pd.notna(put_oi) else np.nan
-    call_chg = chain.loc[chain["Type"].eq("CE"), "Change in OI"].sum(min_count=1)
-    put_chg = chain.loc[chain["Type"].eq("PE"), "Change in OI"].sum(min_count=1)
+    # Aggregate only valid per-contract changes. Show CE and PE separately as well
+    # as the net (PE - CE): the net can legitimately be zero when both sides offset.
+    ce_changes = pd.to_numeric(chain.loc[chain["Type"].eq("CE"), "Change in OI"], errors="coerce")
+    pe_changes = pd.to_numeric(chain.loc[chain["Type"].eq("PE"), "Change in OI"], errors="coerce")
+    call_chg = ce_changes.sum(min_count=1)
+    put_chg = pe_changes.sum(min_count=1)
     oi_diff = put_chg - call_chg if pd.notna(put_chg) and pd.notna(call_chg) else np.nan
     # Store a conservative option-context bias for the signal engine.
     st.session_state.pcr_bias = "Bullish" if pd.notna(pcr) and pd.notna(oi_diff) and pcr >= 1.15 and oi_diff > 0 else "Bearish" if pd.notna(pcr) and pd.notna(oi_diff) and pcr <= 0.85 and oi_diff < 0 else "Neutral"
@@ -736,12 +762,17 @@ def render_option_panel(index_name, spot_price):
         option_signal = "BUY" if pcr >= 1.15 and oi_diff > 0 else "SELL" if pcr <= 0.85 and oi_diff < 0 else "WAIT"
     else:
         option_signal = "WAIT"
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Spot reference", f"{spot_price:,.2f}")
     c2.metric("PCR (displayed strikes)", f"{pcr:.2f}" if pd.notna(pcr) else "N/A")
-    c3.metric("Net OI change (PE−CE)", f"{oi_diff:,.0f}" if pd.notna(oi_diff) else "N/A")
-    c4.metric("Option signal", option_signal)
-    st.caption(note + f" Selected view: {interval_label}. Change in OI = current Angel One OI − previous successful snapshot OI for the same contract token. First snapshot is N/A. A value of 0 means Angel One returned the same OI in both snapshots; if no previous value exists, it remains N/A. This is polling-based change, not broker-provided historical OI for the selected timeframe.")
+    c3.metric("CE OI Change", f"{call_chg:,.0f}" if pd.notna(call_chg) else "N/A")
+    c4.metric("PE OI Change", f"{put_chg:,.0f}" if pd.notna(put_chg) else "N/A")
+    c5.metric("Net OI Change (PE−CE)", f"{oi_diff:,.0f}" if pd.notna(oi_diff) else "N/A")
+    if pd.isna(call_chg) or pd.isna(put_chg):
+        st.warning("OI Change is N/A until at least two successful Angel One snapshots contain valid OI for the same contracts. Keep Auto-refresh enabled and wait for the next successful refresh.")
+    elif call_chg == 0 and put_chg == 0:
+        st.info("Both CE and PE OI are unchanged versus the previous successful snapshot. This is a real zero delta from the received data, not a missing-baseline substitute. If this persists, verify Angel One FULL quote response and that OI is changing on the selected contracts.")
+    st.caption(note + f" Selected view: {interval_label}. Per-contract Change in OI = current Angel One OI − previous successful snapshot OI for the same contract token. First snapshot is N/A. Net OI Change (PE−CE) may be zero if CE and PE changes offset each other. This is polling-based change, not broker-provided historical OI for the selected timeframe.")
     view = chain[["Strike", "Type", "LTP", "OI", "Change in OI"]].copy()
     view["LTP"] = view["LTP"].map(lambda x: round(x, 2) if pd.notna(x) else np.nan)
     st.dataframe(view, use_container_width=True, hide_index=True)
@@ -968,7 +999,13 @@ summary2[4].metric("MTF Status", st.session_state.get("mtf_bias", "N/A"))
 summary2[5].metric("Bullish score confidence", f"{_bull_conf}%")
 summary2[6].metric("Bearish score confidence", f"{_bear_conf}%")
 if pd.isna(last.get("VWAP", np.nan)):
-    st.caption("VWAP unavailable: Angel One candle data has no positive usable volume for this session. No price-only proxy is shown, and VWAP is excluded from signal scoring until real volume is available.")
+    _vwap_volume_total = pd.to_numeric(d.get("Volume", pd.Series(dtype=float)), errors="coerce").fillna(0).clip(lower=0).sum()
+    _vwap_reason = "No positive traded volume was returned for this instrument/session; this is common for spot indices."
+    if _vwap_volume_total > 0:
+        _vwap_reason = "Volume exists, but the latest session's OHLC/volume rows did not produce a valid positive VWAP."
+    st.warning(f"VWAP unavailable — {_vwap_reason} The app will not show a misleading 0.00 or use a price-only proxy. Volume total in loaded candles: {_vwap_volume_total:,.0f}. Choose a tradable stock/futures instrument or a feed that supplies real traded volume to calculate true VWAP.")
+else:
+    st.caption(f"VWAP status: TRUE session VWAP · Latest traded-volume sum in loaded candles: {pd.to_numeric(d.get('Volume', pd.Series(dtype=float)), errors='coerce').fillna(0).clip(lower=0).sum():,.0f}")
 summary3 = st.columns(7)
 summary3[0].metric("Support", _metric_value(last, "Support"))
 summary3[1].metric("Resistance", _metric_value(last, "Resistance"))
@@ -1019,6 +1056,7 @@ _bt_cols[4].metric("Backtest net return", f"{(bt_preview['equity_curve'].dropna(
 st.caption("Backtest winning percentage and results belong to this section only. These are historical EMA 9/20 proxy statistics, not a calibrated future win probability for the current signal.")
 
 st.subheader("📊 Multi Timeframe Alignment")
+st.caption("Open/Close are taken from each timeframe’s own latest completed candle. Yahoo 3m is aggregated from 1m bars; if source bars are unavailable, 3m shows N/A rather than copied 5m data.")
 _mtf_rows = []
 _mtf_display_plan = [
     ("1m", "ONE_MINUTE", "1m", "1d"),
@@ -1027,24 +1065,70 @@ _mtf_display_plan = [
     ("15m", "FIFTEEN_MINUTE", "15m", "5d"),
 ]
 for _label, _angel_tf, _yahoo_interval, _period in _mtf_display_plan:
+    # Each row MUST use a separate request for its own interval. Never derive
+    # 1m/3m/5m/15m OHLC by copying the selected chart's last price.
     if source == "Angel One" and actual_source != "Yahoo fallback":
-        _frame, _mtf_note = get_angel_history(symbol, _angel_tf)
+        _frame, _mtf_note = get_angel_history(symbol, _angel_tf, exchange=("BSE" if symbol in ("^BSESN", "BSESN") else "NSE"))
+    elif source == "Demo (synthetic)":
+        # Demo data is explicitly synthetic; resample the synthetic base candles
+        # to the requested timeframe instead of showing the same candle four times.
+        _base = data.copy().sort_index()
+        _minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15}[_label]
+        _rule = f"{_minutes}min"
+        _frame = _base.resample(_rule, label="left", closed="left").agg({
+            "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+        }).dropna(subset=["Open", "High", "Low", "Close"])
     else:
         _frame = get_yahoo_history(symbol, period=_period, interval=_yahoo_interval)
-    # Use the latest candle's own OHLC values for each timeframe. Do not reuse
-    # the main chart close across timeframes; each timeframe has its own fetch.
-    if not _frame.empty and {"Open", "Close"}.issubset(_frame.columns):
-        _frame = _frame.sort_index()
-        _last_candle = _frame.iloc[-1]
-        _open = safe_float(_last_candle.get("Open", np.nan))
-        _close = safe_float(_last_candle.get("Close", np.nan))
-        if len(_frame) >= 20:
-            _f = _frame["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
-            _sl = _frame["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
-            _trend = "Bullish" if _f > _sl else "Bearish" if _f < _sl else "Neutral"
+        # Yahoo Finance does not support true 3-minute candles consistently.
+        # Build a real 3-minute OHLC aggregation from 1-minute bars when possible;
+        # if unavailable, show N/A instead of pretending 5m data is 3m.
+        if _label == "3m":
+            _one_min = get_yahoo_history(symbol, period="1d", interval="1m")
+            if not _one_min.empty:
+                _one_min = _one_min.sort_index()
+                _frame = _one_min.resample("3min", label="left", closed="left").agg({
+                    "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+                }).dropna(subset=["Open", "High", "Low", "Close"])
+            else:
+                _frame = pd.DataFrame()
+    # Use the latest COMPLETED candle. During a live interval, the still-forming
+    # candle can have a provisional close that resembles the main chart price.
+    if not _frame.empty and {"Open", "High", "Low", "Close"}.issubset(_frame.columns):
+        _frame = _frame.sort_index().copy()
+        _frame = _frame[~_frame.index.duplicated(keep="last")]
+        _minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15}[_label]
+        # Compare timestamps in the same timezone. Angel One candle timestamps can
+        # be timezone-naive (India local time), while Streamlit Cloud may run in UTC.
+        # Comparing naive IST candle times to naive UTC clock can select the wrong bar.
+        try:
+            _idx_tz = getattr(_frame.index, "tz", None)
+            if _idx_tz is None:
+                _frame.index = _frame.index.tz_localize("Asia/Kolkata", ambiguous="NaT", nonexistent="shift_forward")
+                _idx_tz = _frame.index.tz
+            _now = pd.Timestamp.now(tz=_idx_tz)
+            # Candle timestamps mark the candle start, so a bar is complete only
+            # when its start + interval is <= current local time.
+            _completed_mask = (_frame.index + pd.Timedelta(minutes=_minutes)) <= _now
+            _completed = _frame.loc[_completed_mask].copy()
+            _frame = _completed
+        except Exception:
+            # If timezone normalization fails, don't silently reuse a potentially
+            # forming candle; report N/A for this timeframe instead.
+            _frame = pd.DataFrame()
+        if not _frame.empty:
+            _last_candle = _frame.iloc[-1]
+            _open = safe_float(_last_candle.get("Open", np.nan))
+            _close = safe_float(_last_candle.get("Close", np.nan))
+            if len(_frame) >= 20:
+                _f = _frame["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
+                _sl = _frame["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
+                _trend = "Bullish" if _f > _sl else "Bearish" if _f < _sl else "Neutral"
+            else:
+                _trend = "Insufficient candles"
+            _candle_time = str(_frame.index[-1])
         else:
-            _trend = "Insufficient candles"
-        _candle_time = str(_frame.index[-1])
+            _trend, _open, _close, _candle_time = "N/A", np.nan, np.nan, "N/A"
     else:
         _trend, _open, _close, _candle_time = "N/A", np.nan, np.nan, "N/A"
     _mtf_rows.append({
