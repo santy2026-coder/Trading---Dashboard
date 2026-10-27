@@ -2,6 +2,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import numpy as np
@@ -294,11 +295,20 @@ def get_angel_history(symbol, interval="FIVE_MINUTE", exchange="NSE"):
     if not resolved:
         return pd.DataFrame(), f"Could not auto-resolve Angel One token for {symbol} on {exchange}. Try selecting its exact exchange symbol."
     token, trading_symbol = resolved
-    exchange = st.session_state.get("_angel_last_resolved_exchange", exchange)
-    # Prevent a previous index's remembered exchange from leaking into stock requests.
-    if str(symbol).strip().upper() not in ("^NSEI", "NSEI", "^NSEBANK", "NSEBANK", "^BSESN", "BSESN"):
-        exchange = "NSE" if str(exchange).upper() not in ("NSE", "BSE", "NFO", "BFO") else exchange
-    to_dt = datetime.now()
+    # Never reuse a previous symbol's exchange from session_state: that can send
+    # a valid token to the wrong exchange and produce empty candle responses.
+    _raw_symbol = str(symbol).strip().upper()
+    if _raw_symbol in ("^BSESN", "BSESN"):
+        exchange = "BSE"
+    elif _raw_symbol in ("^NSEI", "NSEI", "^NSEBANK", "NSEBANK"):
+        exchange = "NSE"
+    else:
+        exchange = str(exchange or "NSE").upper()
+        if exchange not in ("NSE", "BSE"):
+            exchange = "NSE"
+    # SmartAPI historical date strings are interpreted in India market time.
+    # Streamlit Cloud may run in UTC, so don't send UTC wall-clock values.
+    to_dt = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
     from_dt = to_dt - timedelta(days=5)
     params = {
         "exchange": exchange, "symboltoken": token,
@@ -312,6 +322,8 @@ def get_angel_history(symbol, interval="FIVE_MINUTE", exchange="NSE"):
             return pd.DataFrame(), f"Angel One returned an unexpected candle response for {trading_symbol}."
         if response.get("status") is False:
             return pd.DataFrame(), f"Angel One candle API rejected {trading_symbol}: {response.get('message', '')} (errorcode={response.get('errorcode', 'N/A')})"
+        if "status" in response and response.get("status") not in (True, 1, "true", "True"):
+            return pd.DataFrame(), f"Angel One candle API status={response.get('status')}: {response.get('message', 'no message')} (errorcode={response.get('errorcode', 'N/A')})"
         rows = response.get("data") or []
         if not rows:
             return pd.DataFrame(), f"No candle data returned for {trading_symbol} ({exchange}/{token}, {interval}): {response.get('message', '')}. Check market hours, API permissions, token and interval."
@@ -1130,6 +1142,7 @@ _mtf_display_plan = [
     ("15m", "FIFTEEN_MINUTE", "15m", "5d"),
 ]
 for _label, _angel_tf, _yahoo_interval, _period in _mtf_display_plan:
+    _mtf_note = ""
     # Each row MUST use a separate request for its own interval. Never derive
     # 1m/3m/5m/15m OHLC by copying the selected chart's last price.
     if source == "Angel One" and actual_source != "Yahoo fallback":
@@ -1205,6 +1218,7 @@ for _label, _angel_tf, _yahoo_interval, _period in _mtf_display_plan:
         "Close": f"{_close:,.2f}" if np.isfinite(_close) else "N/A",
         "Trend": _trend,
         "Data Source": ("Angel One API" if source == "Angel One" and actual_source != "Yahoo fallback" else "Yahoo fallback" if source == "Angel One" else actual_source),
+        "Feed/API Status": (_mtf_note if _mtf_note else ("OK · completed candle selected" if np.isfinite(_open) and np.isfinite(_close) else "No completed candle available for this interval")),
     })
 # Guard against a frozen/mis-mapped feed: if every timeframe reports the exact
 # same Open and Close, and each candle is itself flat, this is not trustworthy
@@ -1242,7 +1256,8 @@ if _mtf_feed_suspect:
                 "chart_source": actual_source,
                 "requested_exchange": "BSE" if str(symbol).upper() in ("^BSESN", "BSESN") else "NSE",
                 "intervals_requested": [r["Timeframe"] for r in _mtf_rows],
-                "note": "Each timeframe is requested separately from getCandleData. Review the per-timeframe warnings above for API rejection, empty rows, or token resolution failures.",
+                "api_status_by_timeframe": {r["Timeframe"]: r.get("Feed/API Status", "N/A") for r in _mtf_rows},
+                "note": "Each timeframe is requested separately from getCandleData. Feed/API Status shows the response or why no completed candle was selected. Exchange is resolved per symbol and candle request dates use Asia/Kolkata time.",
             })
 _mtf_table = pd.DataFrame(_mtf_rows)
 st.dataframe(_mtf_table, use_container_width=True, hide_index=True)
