@@ -197,10 +197,17 @@ def find_angel_token(symbol, exchange="NSE"):
     # instrument type and never resolve to a random option/futures contract.
     for candidate in normalized:
         hits = frame[(frame["_sym"] == candidate) | (frame["_name"] == candidate)].copy()
-        if is_index and type_col is not None and not hits.empty:
-            index_hits = hits[hits["_type"].str.contains(r"INDEX|AMXIDX", regex=True, na=False)]
-            if not index_hits.empty:
-                hits = index_hits
+        if is_index:
+            # Never accidentally resolve an index label to an equity/derivative
+            # contract. SmartAPI index candles use the NSE/BSE index instrument.
+            if type_col is not None:
+                index_hits = hits[hits["_type"].str.contains(r"INDEX|AMXIDX", regex=True, na=False)]
+                if not index_hits.empty:
+                    hits = index_hits
+                else:
+                    hits = hits.iloc[0:0]
+            else:
+                hits = hits.iloc[0:0]
         if not hits.empty:
             row = hits.iloc[0]
             token = str(row[token_col]).strip()
@@ -220,9 +227,7 @@ def find_angel_token(symbol, exchange="NSE"):
                 mask = frame["_sym"].isin(["NIFTY", "NIFTY50"]) | frame["_name"].isin(["NIFTY", "NIFTY50"])
             hits = frame[mask].copy()
             if type_col is not None and not hits.empty:
-                index_hits = hits[hits["_type"].str.contains(r"INDEX|AMXIDX", regex=True, na=False)]
-                if not index_hits.empty:
-                    hits = index_hits
+                hits = hits[hits["_type"].str.contains(r"INDEX|AMXIDX", regex=True, na=False)]
             if not hits.empty:
                 row = hits.iloc[0]
                 token = str(row[token_col]).strip()
@@ -246,6 +251,20 @@ def find_angel_token(symbol, exchange="NSE"):
                 if token and token.lower() != "nan":
                     return token, trading_symbol
 
+    # Stable SmartAPI index tokens as a last resort when a broker master file
+    # schema does not expose the index row in the expected format. Do not use
+    # these tokens for ordinary shares.
+    known_index_tokens = {
+        "^NSEI": ("99926000", "Nifty 50", "NSE"),
+        "NSEI": ("99926000", "Nifty 50", "NSE"),
+        "^NSEBANK": ("99926009", "Nifty Bank", "NSE"),
+        "NSEBANK": ("99926009", "Nifty Bank", "NSE"),
+        "^BSESN": ("99919000", "SENSEX", "BSE"),
+        "BSESN": ("99919000", "SENSEX", "BSE"),
+    }
+    if raw in known_index_tokens:
+        token, label, exch = known_index_tokens[raw]
+        return token, label
     return None
 
 def get_angel_history(symbol, interval="FIVE_MINUTE", exchange="NSE"):
@@ -268,15 +287,30 @@ def get_angel_history(symbol, interval="FIVE_MINUTE", exchange="NSE"):
     }
     try:
         response = client.getCandleData(params)
-        rows = (response or {}).get("data") or []
+        if not isinstance(response, dict):
+            return pd.DataFrame(), f"Angel One returned an unexpected candle response for {trading_symbol}."
+        if response.get("status") is False:
+            return pd.DataFrame(), f"Angel One candle API rejected {trading_symbol}: {response.get('message', '')} (errorcode={response.get('errorcode', 'N/A')})"
+        rows = response.get("data") or []
         if not rows:
-            return pd.DataFrame(), f"No candle data returned for {trading_symbol}: {(response or {}).get('message', '')}"
-        df = pd.DataFrame(rows, columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
+            return pd.DataFrame(), f"No candle data returned for {trading_symbol} ({exchange}/{token}, {interval}): {response.get('message', '')}. Check market hours, API permissions, token and interval."
+        # SmartAPI candle rows should contain timestamp, O, H, L, C, volume.
+        rows = [row for row in rows if isinstance(row, (list, tuple)) and len(row) >= 6]
+        if not rows:
+            return pd.DataFrame(), f"Angel One returned malformed candle rows for {trading_symbol}; expected [timestamp, open, high, low, close, volume]."
+        df = pd.DataFrame([row[:6] for row in rows], columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
         df["Datetime"] = pd.to_datetime(df["Datetime"])
         df = df.set_index("Datetime")
         for col in ["Open", "High", "Low", "Close", "Volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df.dropna(subset=["Close"]), f"Angel One candles: {trading_symbol} (token auto-resolved)"
+        df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["Open", "High", "Low", "Close"])
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        # Discard impossible OHLC rows rather than letting bad API values drive signals.
+        sane = (df["High"] >= df[["Open", "Close", "Low"]].max(axis=1)) & (df["Low"] <= df[["Open", "Close", "High"]].min(axis=1))
+        df = df.loc[sane]
+        if df.empty:
+            return pd.DataFrame(), f"Angel One returned no valid OHLC candles for {trading_symbol} ({exchange}/{token}, {interval})."
+        return df, f"Angel One candles: {trading_symbol} · {exchange} token {token} · {interval} · {len(df)} bars"
     except Exception as exc:
         return pd.DataFrame(), f"Angel One candle request failed: {exc}"
 
@@ -900,6 +934,16 @@ if data.empty:
     st.error("No candles received for this instrument/timeframe. Try another symbol, timeframe, or data source.")
     st.stop()
 
+# Make the true data source visible: a successful login does not guarantee that
+# candle requests succeeded; this also makes automatic Yahoo fallback explicit.
+if source == "Angel One":
+    if actual_source == "Yahoo fallback":
+        st.error(f"Angel One login/session may be connected, but the selected instrument candles came from Yahoo fallback. Angel One data is NOT active for this chart. Reason: {data_note}")
+    else:
+        st.success(f"Active candle source: {actual_source}")
+else:
+    st.info(f"Active candle source: {actual_source}")
+
 d = add_indicators(data)
 # Fetch/calculate multi-timeframe context from the selected live data source.
 # When Angel One is active, request each timeframe from Angel One (not Yahoo).
@@ -1069,6 +1113,8 @@ for _label, _angel_tf, _yahoo_interval, _period in _mtf_display_plan:
     # 1m/3m/5m/15m OHLC by copying the selected chart's last price.
     if source == "Angel One" and actual_source != "Yahoo fallback":
         _frame, _mtf_note = get_angel_history(symbol, _angel_tf, exchange=("BSE" if symbol in ("^BSESN", "BSESN") else "NSE"))
+        if _frame.empty:
+            st.warning(f"Angel One MTF {_label} data unavailable: {_mtf_note}")
     elif source == "Demo (synthetic)":
         # Demo data is explicitly synthetic; resample the synthetic base candles
         # to the requested timeframe instead of showing the same candle four times.
@@ -1138,10 +1184,38 @@ for _label, _angel_tf, _yahoo_interval, _period in _mtf_display_plan:
         "Close": f"{_close:,.2f}" if np.isfinite(_close) else "N/A",
         "Trend": _trend,
     })
+# Guard against a frozen/mis-mapped feed: if every timeframe reports the exact
+# same Open and Close, and each candle is itself flat, this is not trustworthy
+# MTF alignment. Do not present it as a valid bullish/bearish confirmation.
+_mtf_numeric = []
+for _r in _mtf_rows:
+    try:
+        _mtf_numeric.append((float(str(_r["Open"]).replace(",", "")),
+                             float(str(_r["Close"]).replace(",", ""))))
+    except (TypeError, ValueError):
+        _mtf_numeric.append((np.nan, np.nan))
+_valid_mtf = [(o, c) for o, c in _mtf_numeric if np.isfinite(o) and np.isfinite(c)]
+_mtf_feed_suspect = (
+    len(_valid_mtf) >= 3
+    and len({round(o, 2) for o, c in _valid_mtf}) == 1
+    and len({round(c, 2) for o, c in _valid_mtf}) == 1
+    and all(abs(o - c) < 0.005 for o, c in _valid_mtf)
+)
+if _mtf_feed_suspect:
+    for _r in _mtf_rows:
+        _r["Open"] = "N/A — feed check"
+        _r["Close"] = "N/A — feed check"
+        _r["Trend"] = "Unverified feed"
+    st.error(
+        "MTF data quality warning: 3 or more timeframes returned the same flat Open/Close. "
+        "This looks like stale, mis-mapped, or non-updating source data; these values are "
+        "not being treated as valid MTF confirmation. Check the selected symbol and data source, "
+        "and verify Angel One candle API responses."
+    )
 _mtf_table = pd.DataFrame(_mtf_rows)
 st.dataframe(_mtf_table, use_container_width=True, hide_index=True)
-_bull_tf = sum(r["Trend"] == "Bullish" for r in _mtf_rows)
-_bear_tf = sum(r["Trend"] == "Bearish" for r in _mtf_rows)
+_bull_tf = 0 if _mtf_feed_suspect else sum(r["Trend"] == "Bullish" for r in _mtf_rows)
+_bear_tf = 0 if _mtf_feed_suspect else sum(r["Trend"] == "Bearish" for r in _mtf_rows)
 _mtf_status = "Strong Bullish Alignment" if _bull_tf >= 3 else "Strong Bearish Alignment" if _bear_tf >= 3 else "Mixed / Partial Alignment"
 if _bull_tf >= 3:
     st.success(f"🔥 {_mtf_status} · Bullish TF: {_bull_tf} · Bearish TF: {_bear_tf}")
