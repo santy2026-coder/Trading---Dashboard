@@ -1238,10 +1238,12 @@ _mtf_feed_suspect = (
     and all(abs(o - c) < 0.005 for o, c in _valid_mtf)
 )
 if _mtf_feed_suspect:
+    # Keep the actual parsed OHLC visible for diagnosis. Do NOT replace real
+    # returned values with N/A: the warning should block confirmation, not hide
+    # the evidence needed to find a stale/mis-mapped candle response.
     for _r in _mtf_rows:
-        _r["Open"] = "N/A — feed check"
-        _r["Close"] = "N/A — feed check"
         _r["Trend"] = "Unverified feed"
+        _r["Feed/API Status"] = str(_r.get("Feed/API Status", "")) + " · identical/flat OHLC suspected; excluded from MTF confirmation"
     st.error(
         f"MTF data quality warning for {symbol_label} ({symbol}): 3 or more timeframes returned the same flat Open/Close. "
         "These values are NOT valid MTF confirmation. Check the Data Source column below. "
@@ -1257,7 +1259,8 @@ if _mtf_feed_suspect:
                 "requested_exchange": "BSE" if str(symbol).upper() in ("^BSESN", "BSESN") else "NSE",
                 "intervals_requested": [r["Timeframe"] for r in _mtf_rows],
                 "api_status_by_timeframe": {r["Timeframe"]: r.get("Feed/API Status", "N/A") for r in _mtf_rows},
-                "note": "Each timeframe is requested separately from getCandleData. Feed/API Status shows the response or why no completed candle was selected. Exchange is resolved per symbol and candle request dates use Asia/Kolkata time.",
+                "parsed_candle_by_timeframe": {r["Timeframe"]: {"candle_time": r.get("Candle Time"), "open": r.get("Open"), "close": r.get("Close"), "trend": r.get("Trend")} for r in _mtf_rows},
+                "note": "Each timeframe is requested separately from getCandleData. Parsed OHLC is kept visible even when suspicious; suspicious values are excluded from MTF confirmation. Exchange is resolved per symbol and candle request dates use Asia/Kolkata time.",
             })
 _mtf_table = pd.DataFrame(_mtf_rows)
 st.dataframe(_mtf_table, use_container_width=True, hide_index=True)
