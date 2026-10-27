@@ -313,8 +313,14 @@ def add_indicators(df):
     d["Stoch_K"] = 100 * (close - low14) / (high14 - low14).replace(0, np.nan)
     d["Stoch_D"] = d["Stoch_K"].rolling(3).mean()
     typical = (high + low + close) / 3
-    cumulative_vol = volume.replace(0, np.nan).cumsum()
-    d["VWAP"] = (typical * volume).cumsum() / cumulative_vol
+    # True volume-weighted VWAP where volume exists. Index feeds sometimes return
+    # zero volume; show a clearly labelled price-only proxy rather than N/A.
+    vol = pd.to_numeric(volume, errors="coerce").fillna(0).clip(lower=0)
+    cumulative_vol = vol.cumsum()
+    true_vwap = (typical * vol).cumsum() / cumulative_vol.replace(0, np.nan)
+    price_proxy = typical.expanding(min_periods=1).mean()
+    d["VWAP"] = true_vwap.where(cumulative_vol > 0, price_proxy)
+    d["VWAP_Is_Proxy"] = cumulative_vol <= 0
     d["Vol_Avg20"] = volume.rolling(20).mean()
     d["Vol_Ratio"] = volume / d["Vol_Avg20"].replace(0, np.nan)
     plus_dm = high.diff()
@@ -913,22 +919,32 @@ def _metric_value(row, col, fmt="{:.2f}"):
         return "N/A"
 
 st.subheader("📊 Trading Dashboard Overview")
+# Side-specific score shares are live rule-strength indicators, not statistically
+# calibrated trade-winning probabilities. Keep backtest statistics in Backtest only.
+_bull_score = int(signal.get("bullish_score", 0))
+_bear_score = int(signal.get("bearish_score", 0))
+_score_total = max(_bull_score + _bear_score, 1)
+_bull_conf = round(100 * _bull_score / _score_total)
+_bear_conf = round(100 * _bear_score / _score_total)
 summary1 = st.columns(7)
 summary1[0].metric("Current Price", f"{float(last['Close']):,.2f}")
 summary1[1].metric("EMA20", _metric_value(last, "EMA20"))
 summary1[2].metric("RSI (14)", _metric_value(last, "RSI", "{:.1f}"))
 summary1[3].metric("MACD", _metric_value(last, "MACD"))
-summary1[4].metric("Backtest Win Rate*", f"{_bt_win_rate:.1f}%" if np.isfinite(_bt_win_rate) else "N/A")
-summary1[5].metric("Bullish Score", signal.get("bullish_score", 0))
-summary1[6].metric("Signal", signal.get("signal", "WAIT"), f"Score {signal.get('score', 0):+d}")
+summary1[4].metric("Bullish Score", _bull_score, f"Score confidence {_bull_conf}%")
+summary1[5].metric("Bearish Score", _bear_score, f"Score confidence {_bear_conf}%")
+summary1[6].metric("Signal", signal.get("signal", "WAIT"), f"Signal confidence {signal.get('confidence', 0)}%")
 summary2 = st.columns(7)
-summary2[0].metric("VWAP", _metric_value(last, "VWAP"))
+_vwap_label = "VWAP (price proxy)" if bool(last.get("VWAP_Is_Proxy", False)) else "VWAP"
+summary2[0].metric(_vwap_label, _metric_value(last, "VWAP"))
 summary2[1].metric("EMA50", _metric_value(last, "EMA50"))
 summary2[2].metric("ATR (14)", _metric_value(last, "ATR"))
 summary2[3].metric("ADX (14)", _metric_value(last, "ADX"))
-summary2[4].metric("Signal Confidence", f"{signal.get('confidence', 0)}%")
-summary2[5].metric("Bearish Score", signal.get("bearish_score", 0))
-summary2[6].metric("MTF Status", st.session_state.get("mtf_bias", "N/A"))
+summary2[4].metric("MTF Status", st.session_state.get("mtf_bias", "N/A"))
+summary2[5].metric("Bullish score confidence", f"{_bull_conf}%")
+summary2[6].metric("Bearish score confidence", f"{_bear_conf}%")
+if bool(last.get("VWAP_Is_Proxy", False)):
+    st.caption("VWAP note: this instrument's candle feed returned no usable volume; the displayed value is a price-only typical-price proxy, not true volume-weighted VWAP.")
 summary3 = st.columns(7)
 summary3[0].metric("Support", _metric_value(last, "Support"))
 summary3[1].metric("Resistance", _metric_value(last, "Resistance"))
@@ -936,8 +952,8 @@ _summary_pcr = safe_float(st.session_state.get("overview_pcr", np.nan))
 _summary_oi = safe_float(st.session_state.get("overview_oi_change", np.nan))
 summary3[2].metric("NIFTY PCR", f"{_summary_pcr:.2f}" if np.isfinite(_summary_pcr) else "N/A")
 summary3[3].metric("Net OI Change (PE−CE)", f"{_summary_oi:,.0f}" if np.isfinite(_summary_oi) else "N/A")
-summary3[4].metric("Positive bars*", _bt_wins if _bt_total else "N/A")
-summary3[5].metric("Negative bars*", _bt_losses if _bt_total else "N/A")
+summary3[4].metric("Volume / Avg", _metric_value(last, "Vol_Ratio", "{:.2f}x"))
+summary3[5].metric("Signal Score", f"{signal.get('score', 0):+d}")
 summary3[6].metric("RR target", signal.get("rr", "N/A"))
 
 # Macro snapshot requested by user: current daily changes, with source availability visible.
@@ -975,8 +991,8 @@ _bt_cols[0].metric("Tested bars", _bt_total if _bt_total else "N/A")
 _bt_cols[1].metric("Positive bars", _bt_wins if _bt_total else "N/A")
 _bt_cols[2].metric("Negative bars", _bt_losses if _bt_total else "N/A")
 _bt_cols[3].metric("Positive-bar ratio", f"{_bt_win_rate:.1f}%" if np.isfinite(_bt_win_rate) else "N/A")
-_bt_cols[4].metric("Rule confidence", f"{signal.get('confidence', 0)}%")
-st.caption("*Backtest values are bar-level EMA 9/20 proxy statistics, not completed trade win rate or a calibrated future win probability. Confidence is rule-score strength, not a guarantee.")
+_bt_cols[4].metric("Backtest net return", f"{(bt_preview['equity_curve'].dropna().iloc[-1]-1)*100:.2f}%" if not bt_preview.empty and not bt_preview['equity_curve'].dropna().empty else "N/A")
+st.caption("Backtest winning percentage and results belong to this section only. These are historical EMA 9/20 proxy statistics, not a calibrated future win probability for the current signal.")
 
 st.subheader("📊 Multi Timeframe Alignment")
 _mtf_rows = []
