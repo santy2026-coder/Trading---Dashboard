@@ -313,14 +313,24 @@ def add_indicators(df):
     d["Stoch_K"] = 100 * (close - low14) / (high14 - low14).replace(0, np.nan)
     d["Stoch_D"] = d["Stoch_K"].rolling(3).mean()
     typical = (high + low + close) / 3
-    # True volume-weighted VWAP where volume exists. Index feeds sometimes return
-    # zero volume; show a clearly labelled price-only proxy rather than N/A.
-    vol = pd.to_numeric(volume, errors="coerce").fillna(0).clip(lower=0)
-    cumulative_vol = vol.cumsum()
-    true_vwap = (typical * vol).cumsum() / cumulative_vol.replace(0, np.nan)
-    price_proxy = typical.expanding(min_periods=1).mean()
-    d["VWAP"] = true_vwap.where(cumulative_vol > 0, price_proxy)
-    d["VWAP_Is_Proxy"] = cumulative_vol <= 0
+    # TRUE session VWAP only: cumulative(Typical Price * Volume) / cumulative(Volume).
+    # Never substitute a price-only average and call it VWAP. Reset accumulation each
+    # calendar session when the candle index is datetime-like. If the feed has no
+    # usable positive volume, VWAP remains NaN and the UI reports it as unavailable.
+    vol = pd.to_numeric(d["Volume"], errors="coerce").fillna(0).clip(lower=0)
+    pv = typical * vol
+    try:
+        idx = pd.to_datetime(d.index, errors="raise")
+        session_key = pd.Series(idx.date, index=d.index)
+        cum_pv = pv.groupby(session_key).cumsum()
+        cum_vol = vol.groupby(session_key).cumsum()
+    except Exception:
+        # For non-datetime indexes, use the available series as one session.
+        cum_pv = pv.cumsum()
+        cum_vol = vol.cumsum()
+    d["VWAP"] = cum_pv / cum_vol.where(cum_vol > 0, np.nan)
+    d["VWAP_Is_Proxy"] = False
+    d["VWAP_Status"] = np.where(cum_vol > 0, "TRUE VWAP", "UNAVAILABLE: no positive volume")
     d["Vol_Avg20"] = volume.rolling(20).mean()
     d["Vol_Ratio"] = volume / d["Vol_Avg20"].replace(0, np.nan)
     plus_dm = high.diff()
@@ -461,7 +471,8 @@ def analyze_signal(d, rr_multiple=2):
         else:
             bear += weight; reasons.append(f"Bearish +{weight}: {bearish_text}")
     add(a["EMA9"] > a["EMA20"], 1, "EMA9 above EMA20", "EMA9 below EMA20")
-    add(a["Close"] > a["VWAP"], 1, "Price above VWAP", "Price below VWAP")
+    vwap_condition = np.nan if pd.isna(a["VWAP"]) else bool(a["Close"] > a["VWAP"])
+    add(vwap_condition, 1, "Price above VWAP", "Price below VWAP")
     add(a["MACD"] > a["MACD_Signal"], 1, "MACD bullish", "MACD bearish")
     add(a["RSI"] >= 52, 1, "RSI above 52", "RSI below bullish threshold")
     add((a["Plus_DI"] > a["Minus_DI"]) and (a["ADX"] >= 18), 1, "ADX/DI bullish trend", "ADX/DI bearish or weak")
@@ -630,22 +641,29 @@ def get_option_chain_snapshot(index_name, spot_price, max_strikes=12):
         fetched = payload.get("fetched") or []
         if not fetched:
             return pd.DataFrame(), f"Angel One returned no option quotes: {(response or {}).get('message', '')}"
-        # SmartAPI quote payload key casing can vary; normalize tokens and quote keys.
-        quote_by_token = {}
+        # SmartAPI quote payload key casing/field names can vary by SDK/API response.
+        # Build token AND trading-symbol indexes so a quote is not silently mismatched.
+        quote_by_token, quote_by_symbol = {}, {}
         for q in fetched:
             if not isinstance(q, dict):
                 continue
             qnorm = {str(k).strip().lower(): v for k, v in q.items()}
             qtoken = qnorm.get("symboltoken", qnorm.get("token", qnorm.get("symbol_token", "")))
+            qsymbol = qnorm.get("tradingsymbol", qnorm.get("trading_symbol", qnorm.get("symbol", "")))
             if qtoken is not None and str(qtoken).strip():
                 quote_by_token[str(qtoken).strip()] = qnorm
+            if qsymbol is not None and str(qsymbol).strip():
+                quote_by_symbol[str(qsymbol).strip().upper()] = qnorm
         records = []
         for _, row in frame.iterrows():
             token = str(row[token_col]).strip()
-            q = quote_by_token.get(token, {})
-            # Angel One commonly returns `opnInterest`; accept documented/common aliases too.
-            oi = q.get("opninterest", q.get("openinterest", q.get("open_interest", q.get("oi", np.nan))))
-            ltp = q.get("ltp", q.get("lasttradedprice", np.nan))
+            symbol_key = str(row[col("symbol")]).strip().upper()
+            q = quote_by_token.get(token) or quote_by_symbol.get(symbol_key) or {}
+            # Accept SmartAPI aliases; parse numeric strings safely and preserve missing as NaN.
+            oi_raw = next((q[k] for k in ("opninterest", "openinterest", "open_interest", "openinterestvalue", "oi") if k in q and q[k] not in (None, "")), np.nan)
+            ltp_raw = next((q[k] for k in ("ltp", "lasttradedprice", "last_traded_price") if k in q and q[k] not in (None, "")), np.nan)
+            oi = pd.to_numeric(pd.Series([oi_raw]), errors="coerce").iloc[0]
+            ltp = safe_float(ltp_raw)
             records.append({
                 "Expiry": str(row["_expiry"].date()),
                 "Strike": float(row["_strike"]),
@@ -664,12 +682,19 @@ def get_option_chain_snapshot(index_name, spot_price, max_strikes=12):
         previous = history[-1]["quotes"] if history else {}
         # First successful snapshot has no baseline: report N/A, not a misleading zero.
         # From the second snapshot onward, compare only tokens present in the previous snapshot.
+        # Normalize token keys consistently. A real zero change is valid only when
+        # both current and previous OI exist; missing baselines remain NaN/N/A.
+        previous = {str(k).strip(): pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
+                    for k, v in previous.items()}
+        result["Token"] = result["Token"].astype(str).str.strip()
+        result["OI"] = pd.to_numeric(result["OI"], errors="coerce")
         result["Change in OI"] = result.apply(
-            lambda r: (r["OI"] - previous[r["Token"]])
-            if pd.notna(r["OI"]) and r["Token"] in previous else np.nan,
+            lambda r: float(r["OI"]) - float(previous[str(r["Token"])])
+            if pd.notna(r["OI"]) and str(r["Token"]) in previous and pd.notna(previous[str(r["Token"])])
+            else np.nan,
             axis=1,
         )
-        quote_map = {r["Token"]: r["OI"] for _, r in result.iterrows() if pd.notna(r["OI"])}
+        quote_map = {str(r["Token"]): float(r["OI"]) for _, r in result.iterrows() if pd.notna(r["OI"])}
         history.append({"time": now, "quotes": quote_map})
         history = [h for h in history if now - h["time"] <= timedelta(minutes=20)]
         st.session_state[cache_key] = history
@@ -716,7 +741,7 @@ def render_option_panel(index_name, spot_price):
     c2.metric("PCR (displayed strikes)", f"{pcr:.2f}" if pd.notna(pcr) else "N/A")
     c3.metric("Net OI change (PE−CE)", f"{oi_diff:,.0f}" if pd.notna(oi_diff) else "N/A")
     c4.metric("Option signal", option_signal)
-    st.caption(note + f" Selected view: {interval_label}. Change in OI is calculated from consecutive successful Angel One snapshots. The first snapshot is the baseline (N/A); the next successful refresh calculates the difference. This is not broker-provided historical OI for the selected timeframe.")
+    st.caption(note + f" Selected view: {interval_label}. Change in OI = current Angel One OI − previous successful snapshot OI for the same contract token. First snapshot is N/A. A value of 0 means Angel One returned the same OI in both snapshots; if no previous value exists, it remains N/A. This is polling-based change, not broker-provided historical OI for the selected timeframe.")
     view = chain[["Strike", "Type", "LTP", "OI", "Change in OI"]].copy()
     view["LTP"] = view["LTP"].map(lambda x: round(x, 2) if pd.notna(x) else np.nan)
     st.dataframe(view, use_container_width=True, hide_index=True)
@@ -935,16 +960,15 @@ summary1[4].metric("Bullish Score", _bull_score, f"Score confidence {_bull_conf}
 summary1[5].metric("Bearish Score", _bear_score, f"Score confidence {_bear_conf}%")
 summary1[6].metric("Signal", signal.get("signal", "WAIT"), f"Signal confidence {signal.get('confidence', 0)}%")
 summary2 = st.columns(7)
-_vwap_label = "VWAP (price proxy)" if bool(last.get("VWAP_Is_Proxy", False)) else "VWAP"
-summary2[0].metric(_vwap_label, _metric_value(last, "VWAP"))
+summary2[0].metric("VWAP (session, volume-weighted)", _metric_value(last, "VWAP"))
 summary2[1].metric("EMA50", _metric_value(last, "EMA50"))
 summary2[2].metric("ATR (14)", _metric_value(last, "ATR"))
 summary2[3].metric("ADX (14)", _metric_value(last, "ADX"))
 summary2[4].metric("MTF Status", st.session_state.get("mtf_bias", "N/A"))
 summary2[5].metric("Bullish score confidence", f"{_bull_conf}%")
 summary2[6].metric("Bearish score confidence", f"{_bear_conf}%")
-if bool(last.get("VWAP_Is_Proxy", False)):
-    st.caption("VWAP note: this instrument's candle feed returned no usable volume; the displayed value is a price-only typical-price proxy, not true volume-weighted VWAP.")
+if pd.isna(last.get("VWAP", np.nan)):
+    st.caption("VWAP unavailable: Angel One candle data has no positive usable volume for this session. No price-only proxy is shown, and VWAP is excluded from signal scoring until real volume is available.")
 summary3 = st.columns(7)
 summary3[0].metric("Support", _metric_value(last, "Support"))
 summary3[1].metric("Resistance", _metric_value(last, "Resistance"))
@@ -998,7 +1022,7 @@ st.subheader("📊 Multi Timeframe Alignment")
 _mtf_rows = []
 _mtf_display_plan = [
     ("1m", "ONE_MINUTE", "1m", "1d"),
-    ("3m", "THREE_MINUTE", "5m", "5d"),
+    ("3m", "THREE_MINUTE", "3m", "5d"),
     ("5m", "FIVE_MINUTE", "5m", "5d"),
     ("15m", "FIFTEEN_MINUTE", "15m", "5d"),
 ]
@@ -1007,14 +1031,29 @@ for _label, _angel_tf, _yahoo_interval, _period in _mtf_display_plan:
         _frame, _mtf_note = get_angel_history(symbol, _angel_tf)
     else:
         _frame = get_yahoo_history(symbol, period=_period, interval=_yahoo_interval)
-    if not _frame.empty and len(_frame) >= 20:
-        _f = _frame["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
-        _sl = _frame["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
-        _trend = "Bullish" if _f > _sl else "Bearish" if _f < _sl else "Neutral"
-        _close = float(_frame["Close"].iloc[-1])
+    # Use the latest candle's own OHLC values for each timeframe. Do not reuse
+    # the main chart close across timeframes; each timeframe has its own fetch.
+    if not _frame.empty and {"Open", "Close"}.issubset(_frame.columns):
+        _frame = _frame.sort_index()
+        _last_candle = _frame.iloc[-1]
+        _open = safe_float(_last_candle.get("Open", np.nan))
+        _close = safe_float(_last_candle.get("Close", np.nan))
+        if len(_frame) >= 20:
+            _f = _frame["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
+            _sl = _frame["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
+            _trend = "Bullish" if _f > _sl else "Bearish" if _f < _sl else "Neutral"
+        else:
+            _trend = "Insufficient candles"
+        _candle_time = str(_frame.index[-1])
     else:
-        _trend, _close = "N/A", np.nan
-    _mtf_rows.append({"Timeframe": _label, "Trend": _trend, "Latest Close": f"{_close:,.2f}" if np.isfinite(_close) else "N/A"})
+        _trend, _open, _close, _candle_time = "N/A", np.nan, np.nan, "N/A"
+    _mtf_rows.append({
+        "Timeframe": _label,
+        "Candle Time": _candle_time,
+        "Open": f"{_open:,.2f}" if np.isfinite(_open) else "N/A",
+        "Close": f"{_close:,.2f}" if np.isfinite(_close) else "N/A",
+        "Trend": _trend,
+    })
 _mtf_table = pd.DataFrame(_mtf_rows)
 st.dataframe(_mtf_table, use_container_width=True, hide_index=True)
 _bull_tf = sum(r["Trend"] == "Bullish" for r in _mtf_rows)
