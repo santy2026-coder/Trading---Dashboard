@@ -406,6 +406,40 @@ def add_price_action_columns(d):
     x.loc[(x["Low"] < prior_lo) & (x["Close"] > prior_lo), "Liquidity Sweep"] = "Sell-side sweep candidate"
     return x
 
+def get_daily_change(ticker):
+    """Cached daily percent change for macro context; returns NaN when unavailable."""
+    try:
+        hist = get_yahoo_history(ticker, period="10d", interval="1d")
+        if hist is None or hist.empty or len(hist) < 2:
+            return np.nan
+        previous = safe_float(hist["Close"].iloc[-2])
+        current = safe_float(hist["Close"].iloc[-1])
+        return (current / previous - 1.0) * 100.0 if np.isfinite(previous) and previous else np.nan
+    except Exception:
+        return np.nan
+
+
+def build_macro_context():
+    """Build transparent macro snapshot. Not a substitute for live exchange feeds."""
+    tickers = {
+        "S&P 500": "^GSPC", "NASDAQ": "^IXIC", "Dow Jones": "^DJI",
+        "NIFTY 50": "^NSEI", "BANK NIFTY": "^NSEBANK", "Brent Crude": "BZ=F",
+        "USD/INR": "INR=X", "India VIX": "^INDIAVIX",
+    }
+    changes = {name: get_daily_change(ticker) for name, ticker in tickers.items()}
+    # Positive global equities help risk appetite; rising crude, USD/INR and VIX are
+    # treated as India-risk headwinds. Missing feeds contribute zero, not a guess.
+    score = 0
+    for name in ("S&P 500", "NASDAQ", "Dow Jones", "NIFTY 50", "BANK NIFTY"):
+        value = changes.get(name, np.nan)
+        if np.isfinite(value): score += 1 if value > 0.15 else -1 if value < -0.15 else 0
+    for name in ("Brent Crude", "USD/INR", "India VIX"):
+        value = changes.get(name, np.nan)
+        if np.isfinite(value): score += -1 if value > 0.30 else 1 if value < -0.30 else 0
+    bias = "Bullish" if score >= 2 else "Bearish" if score <= -2 else "Mixed / neutral"
+    return changes, score, bias
+
+
 def analyze_signal(d, rr_multiple=2):
     if len(d) < 30:
         return {"signal": "WAIT", "score": 0, "confidence": 0, "reasons": ["Not enough candles for stable indicators."], "patterns": []}
@@ -470,6 +504,12 @@ def analyze_signal(d, rr_multiple=2):
     pcr_bias = st.session_state.get("pcr_bias", "N/A")
     if pcr_bias == "Bullish": bull += 1; reasons.append("Bullish +1: option-chain PCR/OI context (prior successful refresh)")
     elif pcr_bias == "Bearish": bear += 1; reasons.append("Bearish +1: option-chain PCR/OI context (prior successful refresh)")
+    # Macro context is a low-weight confirmation only; unavailable macro data is ignored.
+    macro_bias = st.session_state.get("macro_bias", "N/A")
+    if macro_bias == "Bullish":
+        bull += 1; reasons.append("Macro +1: global/Indian risk context is supportive")
+    elif macro_bias == "Bearish":
+        bear += 1; reasons.append("Macro +1: global/Indian risk context is risk-off")
     score = bull - bear
     # Require a directional edge and minimum number of supporting checks.
     signal = "BUY" if score >= 4 and bull >= 5 else "SELL" if score <= -4 and bear >= 5 else "WAIT"
@@ -639,7 +679,15 @@ def render_option_panel(index_name, spot_price):
         f"{index_name} interval", ["3 mins", "5 mins", "15 mins"],
         horizontal=True, key=f"oi_interval_{index_name}"
     )
-    chain, note = get_option_chain_snapshot(index_name, spot_price)
+    _run_cache = st.session_state.get("_option_chain_run_cache", {})
+    if index_name in _run_cache:
+        chain, note, _cached_spot = _run_cache[index_name]
+        if np.isfinite(_cached_spot) and _cached_spot > 0:
+            spot_price = float(_cached_spot)
+    else:
+        chain, note = get_option_chain_snapshot(index_name, spot_price)
+        _run_cache[index_name] = (chain, note, spot_price)
+        st.session_state["_option_chain_run_cache"] = _run_cache
     if chain.empty:
         st.session_state.pcr_bias = "N/A"
         st.info(note)
@@ -807,6 +855,43 @@ for _label, _angel_tf, _period in _mtf_fetch_plan:
         _slow = _mtf_df["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
         mtf_votes.append(1 if _fast > _slow else -1)
 st.session_state.mtf_bias = "Bullish" if len(mtf_votes) >= 2 and sum(mtf_votes) == 2 else "Bearish" if len(mtf_votes) >= 2 and sum(mtf_votes) == -2 else "Mixed" if mtf_votes else "N/A"
+_macro_changes, _macro_score, _macro_bias = build_macro_context()
+st.session_state["macro_changes"] = _macro_changes
+st.session_state["macro_bias"] = _macro_bias
+# Snapshot NIFTY option-chain once per rerun so Overview PCR/OI and the panel use
+# the same quote snapshot (prevents accidental double-polling from zeroing OI change).
+st.session_state["_option_chain_run_cache"] = {}
+try:
+    if source == "Angel One" and actual_source != "Yahoo fallback":
+        _nifty_spot_df, _nifty_spot_note = get_angel_history("^NSEI", "FIVE_MINUTE")
+        _nifty_spot = float(_nifty_spot_df["Close"].iloc[-1]) if not _nifty_spot_df.empty else np.nan
+    else:
+        _nifty_spot_df = get_yahoo_history("^NSEI", period="5d", interval="5m")
+        _nifty_spot = float(_nifty_spot_df["Close"].iloc[-1]) if not _nifty_spot_df.empty else np.nan
+    if np.isfinite(_nifty_spot) and _nifty_spot > 0:
+        _nifty_chain, _nifty_chain_note = get_option_chain_snapshot("NIFTY", _nifty_spot)
+        st.session_state["_option_chain_run_cache"]["NIFTY"] = (_nifty_chain, _nifty_chain_note, _nifty_spot)
+        if not _nifty_chain.empty:
+            _call_oi = _nifty_chain.loc[_nifty_chain["Type"].eq("CE"), "OI"].sum(min_count=1)
+            _put_oi = _nifty_chain.loc[_nifty_chain["Type"].eq("PE"), "OI"].sum(min_count=1)
+            _call_chg = _nifty_chain.loc[_nifty_chain["Type"].eq("CE"), "Change in OI"].sum(min_count=1)
+            _put_chg = _nifty_chain.loc[_nifty_chain["Type"].eq("PE"), "Change in OI"].sum(min_count=1)
+            st.session_state["overview_pcr"] = (_put_oi / _call_oi) if pd.notna(_put_oi) and pd.notna(_call_oi) and _call_oi > 0 else np.nan
+            st.session_state["overview_oi_change"] = (_put_chg - _call_chg) if pd.notna(_put_chg) and pd.notna(_call_chg) else np.nan
+            _pcr_now = safe_float(st.session_state["overview_pcr"])
+            _oi_now = safe_float(st.session_state["overview_oi_change"])
+            st.session_state["pcr_bias"] = ("Bullish" if np.isfinite(_pcr_now) and np.isfinite(_oi_now) and _pcr_now >= 1.15 and _oi_now > 0
+                else "Bearish" if np.isfinite(_pcr_now) and np.isfinite(_oi_now) and _pcr_now <= 0.85 and _oi_now < 0
+                else "Neutral" if np.isfinite(_pcr_now) and np.isfinite(_oi_now) else "N/A")
+        else:
+            st.session_state["overview_pcr"] = np.nan
+            st.session_state["overview_oi_change"] = np.nan
+    else:
+        st.session_state["overview_pcr"] = np.nan
+        st.session_state["overview_oi_change"] = np.nan
+except Exception:
+    st.session_state["overview_pcr"] = np.nan
+    st.session_state["overview_oi_change"] = np.nan
 signal = analyze_signal(d, rr_multiple)
 last = d.iloc[-1]
 st.caption(f"Selected: **{symbol_label}** · Data source: **{actual_source}** · Last candle: {d.index[-1]}")
@@ -831,26 +916,67 @@ st.subheader("📊 Trading Dashboard Overview")
 summary1 = st.columns(7)
 summary1[0].metric("Current Price", f"{float(last['Close']):,.2f}")
 summary1[1].metric("EMA20", _metric_value(last, "EMA20"))
-summary1[2].metric("RSI", _metric_value(last, "RSI", "{:.1f}"))
+summary1[2].metric("RSI (14)", _metric_value(last, "RSI", "{:.1f}"))
 summary1[3].metric("MACD", _metric_value(last, "MACD"))
-summary1[4].metric("Backtest Win Rate", f"{_bt_win_rate:.1f}%" if np.isfinite(_bt_win_rate) else "N/A")
+summary1[4].metric("Backtest Win Rate*", f"{_bt_win_rate:.1f}%" if np.isfinite(_bt_win_rate) else "N/A")
 summary1[5].metric("Bullish Score", signal.get("bullish_score", 0))
-summary1[6].metric("Signal Quality", signal.get("signal", "WAIT"))
+summary1[6].metric("Signal", signal.get("signal", "WAIT"), f"Score {signal.get('score', 0):+d}")
 summary2 = st.columns(7)
 summary2[0].metric("VWAP", _metric_value(last, "VWAP"))
 summary2[1].metric("EMA50", _metric_value(last, "EMA50"))
-summary2[2].metric("ATR", _metric_value(last, "ATR"))
-summary2[3].metric("ADX", _metric_value(last, "ADX"))
-summary2[4].metric("Rule Confidence", f"{signal.get('confidence', 0)}%")
+summary2[2].metric("ATR (14)", _metric_value(last, "ATR"))
+summary2[3].metric("ADX (14)", _metric_value(last, "ADX"))
+summary2[4].metric("Signal Confidence", f"{signal.get('confidence', 0)}%")
 summary2[5].metric("Bearish Score", signal.get("bearish_score", 0))
 summary2[6].metric("MTF Status", st.session_state.get("mtf_bias", "N/A"))
-summary3 = st.columns(5)
+summary3 = st.columns(7)
 summary3[0].metric("Support", _metric_value(last, "Support"))
 summary3[1].metric("Resistance", _metric_value(last, "Resistance"))
-summary3[2].metric("Backtest Positive Bars", _bt_wins if _bt_total else "N/A")
-summary3[3].metric("Backtest Negative Bars", _bt_losses if _bt_total else "N/A")
-summary3[4].metric("Risk : Reward", signal.get("rr", "N/A"))
-st.caption("Backtest bar counts are proxy results, not a promise of future performance. Rule confidence is not the same as win probability.")
+_summary_pcr = safe_float(st.session_state.get("overview_pcr", np.nan))
+_summary_oi = safe_float(st.session_state.get("overview_oi_change", np.nan))
+summary3[2].metric("NIFTY PCR", f"{_summary_pcr:.2f}" if np.isfinite(_summary_pcr) else "N/A")
+summary3[3].metric("Net OI Change (PE−CE)", f"{_summary_oi:,.0f}" if np.isfinite(_summary_oi) else "N/A")
+summary3[4].metric("Positive bars*", _bt_wins if _bt_total else "N/A")
+summary3[5].metric("Negative bars*", _bt_losses if _bt_total else "N/A")
+summary3[6].metric("RR target", signal.get("rr", "N/A"))
+
+# Macro snapshot requested by user: current daily changes, with source availability visible.
+_macro_changes = st.session_state.get("macro_changes", {})
+_macro_bias = st.session_state.get("macro_bias", "N/A")
+st.markdown("#### 🌍 Global sentiment & macro effect")
+macro_cols = st.columns(6)
+for _col, _name in zip(macro_cols, ["S&P 500", "NASDAQ", "NIFTY 50", "Brent Crude", "USD/INR", "India VIX"]):
+    _val = safe_float(_macro_changes.get(_name, np.nan))
+    _ticker_val = f"{_val:+.2f}%" if np.isfinite(_val) else "N/A"
+    _col.metric(_name, _ticker_val)
+st.info(f"Macro sentiment: **{_macro_bias}** · Calculated from available daily index, Brent, USD/INR and VIX changes; missing feeds are excluded.")
+
+st.markdown("#### 🎯 Suggested two entry prices")
+_entry1, _entry2 = st.columns(2)
+_px = safe_float(last.get("Close", np.nan)); _atr = safe_float(last.get("ATR", np.nan))
+if signal.get("signal") in ("BUY", "SELL") and np.isfinite(_px):
+    _offset = max(_atr * 0.25, _px * 0.0005) if np.isfinite(_atr) and _atr > 0 else _px * 0.001
+    if signal["signal"] == "BUY":
+        _entry_a, _entry_b = _px, _px - _offset
+        _entry1.metric("Entry 1 — breakout/current reference", f"{_entry_a:,.2f}")
+        _entry2.metric("Entry 2 — pullback reference", f"{_entry_b:,.2f}")
+    else:
+        _entry_a, _entry_b = _px, _px + _offset
+        _entry1.metric("Entry 1 — breakdown/current reference", f"{_entry_a:,.2f}")
+        _entry2.metric("Entry 2 — pullback/retest reference", f"{_entry_b:,.2f}")
+else:
+    _entry1.metric("Entry 1", "WAIT — no confirmed setup")
+    _entry2.metric("Entry 2", "WAIT — no confirmed setup")
+st.caption("Entry prices are calculated reference levels, not guaranteed fills or broker orders. Wait for price/volume confirmation; avoid treating them as certain predictions.")
+
+st.markdown("#### 🧪 Backtest winning details")
+_bt_cols = st.columns(5)
+_bt_cols[0].metric("Tested bars", _bt_total if _bt_total else "N/A")
+_bt_cols[1].metric("Positive bars", _bt_wins if _bt_total else "N/A")
+_bt_cols[2].metric("Negative bars", _bt_losses if _bt_total else "N/A")
+_bt_cols[3].metric("Positive-bar ratio", f"{_bt_win_rate:.1f}%" if np.isfinite(_bt_win_rate) else "N/A")
+_bt_cols[4].metric("Rule confidence", f"{signal.get('confidence', 0)}%")
+st.caption("*Backtest values are bar-level EMA 9/20 proxy statistics, not completed trade win rate or a calibrated future win probability. Confidence is rule-score strength, not a guarantee.")
 
 st.subheader("📊 Multi Timeframe Alignment")
 _mtf_rows = []
