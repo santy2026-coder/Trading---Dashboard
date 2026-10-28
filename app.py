@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -12,7 +13,7 @@ import streamlit as st
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
 
-# Optional broker dependencies: Yahoo/demo mode can still run if SmartAPI is not installed.
+# Optional broker dependencies: historical REST login and WebSocket availability are tracked separately.
 try:
     from SmartApi import SmartConnect
     import pyotp
@@ -21,6 +22,13 @@ except Exception:
     SmartConnect = None
     pyotp = None
     SMARTAPI_AVAILABLE = False
+
+try:
+    from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+    SMARTAPI_WS_AVAILABLE = True
+except Exception:
+    SmartWebSocketV2 = None
+    SMARTAPI_WS_AVAILABLE = False
 
 st.set_page_config(page_title="Trading Intelligence Terminal", page_icon="📈", layout="wide")
 
@@ -122,6 +130,211 @@ def download_instrument_master():
     except Exception:
         return pd.DataFrame()
 
+class AngelWebSocketManager:
+    """Process-level SmartAPI WebSocket V2 manager; keeps latest ticks across Streamlit reruns."""
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.ws = None
+        self.thread = None
+        self.connected = False
+        self.status = "Not started"
+        self.error = ""
+        self.ticks = {}
+        self.active = None
+        self.credentials_key = None
+
+    def start(self, auth_token, api_key, client_code, feed_token):
+        if not SMARTAPI_WS_AVAILABLE:
+            self.status = "WebSocket SDK unavailable; install smartapi-python and websocket-client."
+            return False
+        key = (str(client_code), str(api_key), str(feed_token))
+        with self.lock:
+            if self.thread and self.thread.is_alive() and self.credentials_key == key:
+                return True
+            # Do not create duplicate sockets for the same account/session.
+            self.ws = None
+            self.connected = False
+            self.error = ""
+            self.status = "Connecting WebSocket…"
+            self.credentials_key = key
+            try:
+                self.ws = SmartWebSocketV2(auth_token, api_key, client_code, feed_token,
+                                           max_retry_attempt=5, retry_strategy=1,
+                                           retry_delay=2, retry_multiplier=2, retry_duration=60)
+                ws = self.ws
+                def on_open(wsapp):
+                    with self.lock:
+                        self.connected = True
+                        self.status = "Connected — waiting for ticks"
+                        active = self.active
+                    if active:
+                        try:
+                            ws.subscribe("trading-terminal", 1, [active])
+                        except Exception as exc:
+                            with self.lock:
+                                self.error = str(exc)
+                                self.status = "Connected; subscription error"
+                def on_data(wsapp, message):
+                    if not isinstance(message, dict):
+                        return
+                    try:
+                        token = str(message.get("token", message.get("symboltoken", ""))).strip()
+                        raw_price = message.get("last_traded_price", message.get("ltp"))
+                        if not token or raw_price is None:
+                            return
+                        # SmartAPI V2 prices are integer paise (price x 100).
+                        price = float(raw_price) / 100.0
+                        if not np.isfinite(price) or price <= 0:
+                            return
+                        tick = {"token": token, "ltp": price, "received_at": time.time(),
+                                "exchange_timestamp": message.get("exchange_timestamp"),
+                                "volume": message.get("volume_trade_for_the_day", message.get("volume", None)),
+                                "raw": message}
+                        with self.lock:
+                            self.ticks[token] = tick
+                            self.status = "Live ticks flowing"
+                    except Exception as exc:
+                        with self.lock:
+                            self.error = str(exc)
+                def on_error(wsapp, error):
+                    with self.lock:
+                        self.error = str(error)
+                        self.status = "WebSocket error"
+                def on_close(wsapp):
+                    with self.lock:
+                        self.connected = False
+                        if not self.error:
+                            self.status = "Disconnected; reconnect on next app action"
+                ws.on_open = on_open
+                ws.on_data = on_data
+                ws.on_error = on_error
+                ws.on_close = on_close
+                self.thread = threading.Thread(target=self._run_socket, args=(ws,), daemon=True,
+                                               name="angel-smartapi-websocket")
+                self.thread.start()
+                return True
+            except Exception as exc:
+                self.error = str(exc)
+                self.status = "WebSocket start failed"
+                return False
+
+    @staticmethod
+    def _run_socket(ws):
+        try:
+            ws.connect()
+        except Exception:
+            # SDK callback should normally capture errors; connect can still throw synchronously.
+            pass
+
+    def subscribe(self, exchange_type, token):
+        token = str(token).strip()
+        if not token:
+            return
+        new = {"exchangeType": int(exchange_type), "tokens": [token]}
+        with self.lock:
+            old = self.active
+            ws = self.ws
+            connected = self.connected
+            if old and old.get("tokens") == [token] and old.get("exchangeType") == int(exchange_type):
+                return
+            self.active = new
+        if connected and ws:
+            try:
+                if old:
+                    ws.unsubscribe("trading-terminal", 1, [old])
+                ws.subscribe("trading-terminal", 1, [new])
+                with self.lock:
+                    self.status = f"Subscribed to token {token}; waiting for live tick"
+            except Exception as exc:
+                with self.lock:
+                    self.error = str(exc)
+                    self.status = "Subscription failed"
+
+    def get_tick(self, token):
+        with self.lock:
+            tick = self.ticks.get(str(token))
+            return dict(tick) if tick else None
+
+    def snapshot(self):
+        with self.lock:
+            return {"connected": self.connected, "status": self.status, "error": self.error,
+                    "tick_count": len(self.ticks), "active": dict(self.active) if self.active else None}
+
+@st.cache_resource
+def get_angel_ws_manager():
+    return AngelWebSocketManager()
+
+def _start_angel_websocket(login_result):
+    client = st.session_state.get("angel_session")
+    if client is None:
+        return False
+    payload = (login_result or {}).get("data") or {}
+    auth_token = payload.get("jwtToken") or payload.get("jwt_token") or getattr(client, "access_token", None)
+    try:
+        feed_token = client.getfeedToken()
+    except Exception:
+        feed_token = payload.get("feedToken") or payload.get("feed_token")
+    if not auth_token or not feed_token:
+        st.session_state.angel_ws_status = "Login succeeded, but JWT/feed token was unavailable for WebSocket."
+        return False
+    manager = get_angel_ws_manager()
+    ok = manager.start(auth_token, st.session_state.angel_api.strip(),
+                       st.session_state.angel_client.strip(), feed_token)
+    st.session_state.angel_ws_status = manager.snapshot()["status"]
+    return ok
+
+def _active_angel_token(symbol):
+    exchange = "BSE" if str(symbol).strip().upper() in ("^BSESN", "BSESN") else "NSE"
+    resolved = find_angel_token(symbol, exchange)
+    if not resolved:
+        return None
+    token, _label = resolved
+    exchange = st.session_state.get("_angel_last_resolved_exchange", exchange)
+    exchange_type = 3 if str(exchange).upper() == "BSE" else 1
+    return exchange_type, str(token)
+
+def _merge_websocket_tick(candles, symbol, interval_label="5 minutes"):
+    """Apply the latest websocket LTP to a provisional current candle, if available."""
+    if candles is None or candles.empty or st.session_state.get("source") != "Angel One":
+        return candles, ""
+    resolved = _active_angel_token(symbol)
+    if not resolved:
+        return candles, "WebSocket token could not be resolved."
+    _exchange_type, token = resolved
+    manager = get_angel_ws_manager()
+    manager.subscribe(_exchange_type, token)
+    tick = manager.get_tick(token)
+    if not tick:
+        return candles, "Waiting for first WebSocket tick; displaying latest historical candles meanwhile."
+    age = max(0.0, time.time() - float(tick.get("received_at", time.time())))
+    if age > 30:
+        return candles, f"Last WebSocket tick is stale ({age:.0f}s old); showing historical candles until feed resumes."
+    frame = candles.copy()
+    ltp = float(tick["ltp"])
+    now = pd.Timestamp.now()
+    if frame.index.tz is not None and now.tzinfo is None:
+        now = now.tz_localize(frame.index.tz)
+    elif frame.index.tz is None and now.tzinfo is not None:
+        now = now.tz_localize(None)
+    minutes = {"1 minute": 1, "3 minutes": 3, "5 minutes": 5, "15 minutes": 15, "Daily": 1440}.get(interval_label, 5)
+    bucket = now.floor(f"{minutes}min")
+    last_idx = frame.index[-1]
+    # Update the existing provisional candle for this timeframe, or append one at the correct bucket.
+    target_idx = bucket if bucket in frame.index else None
+    if target_idx is None and pd.Timestamp(last_idx).floor(f"{minutes}min") == bucket:
+        target_idx = last_idx
+    if target_idx is not None:
+        frame.loc[target_idx, "High"] = max(float(frame.loc[target_idx, "High"]), ltp)
+        frame.loc[target_idx, "Low"] = min(float(frame.loc[target_idx, "Low"]), ltp)
+        frame.loc[target_idx, "Close"] = ltp
+    else:
+        # Provisional candle begins at the first tick observed in this interval.
+        row = {c: np.nan for c in frame.columns}
+        row.update({"Open": ltp, "High": ltp, "Low": ltp, "Close": ltp, "Volume": 0.0})
+        frame.loc[bucket, list(row.keys())] = list(row.values())
+        frame = frame.sort_index()
+    return frame, f"WebSocket live LTP ₹{ltp:,.2f} · tick age {age:.1f}s"
+
 def connect_angel():
     if not SMARTAPI_AVAILABLE:
         raise RuntimeError("SmartAPI/pyotp package is unavailable. Install requirements.txt and redeploy.")
@@ -139,6 +352,7 @@ def connect_angel():
     st.session_state.angel_session = client
     clear_angel_request_caches() if "clear_angel_request_caches" in globals() else None
     st.session_state.angel_status = "Connected"
+    _start_angel_websocket(result)
     return result
 
 def find_angel_token(symbol, exchange="NSE"):
@@ -1026,7 +1240,7 @@ with st.sidebar:
     angel_interval = {"1 minute": "ONE_MINUTE", "3 minutes": "THREE_MINUTE", "5 minutes": "FIVE_MINUTE", "15 minutes": "FIFTEEN_MINUTE", "Daily": "ONE_DAY"}[interval_label]
     rr_multiple = st.selectbox("Risk : Reward target (T1)", [1, 2, 3, 5], index=1, format_func=lambda x: f"1:{x}")
     refresh_enabled = st.toggle("Auto-refresh", value=True, help="Keeps live quote snapshots updating so Change in OI can compare the latest snapshot with the previous one.")
-    refresh_seconds = st.selectbox("Refresh interval", [10, 15, 30, 60], index=2, help="Broker requests are cached briefly and rate-limited to prevent Exceeding excess errors. This interval refreshes the dashboard, not necessarily the exchange feed.")
+    refresh_seconds = st.selectbox("Dashboard display refresh", [5, 10, 15, 30, 60], index=0, help="WebSocket ticks arrive independently; this controls how often the Streamlit screen redraws. REST candle/option requests remain cached to limit API usage.")
     st.session_state.refresh_on = refresh_enabled
     if refresh_enabled:
         st_autorefresh(interval=refresh_seconds * 1000, key="market_refresh")
@@ -1048,6 +1262,11 @@ with st.sidebar:
             st.session_state.angel_status = "Connection failed"
             st.error(str(exc))
     st.caption(f"Status: {st.session_state.angel_status}")
+    if source == "Angel One" and st.session_state.angel_session is not None:
+        _ws_snapshot = get_angel_ws_manager().snapshot()
+        st.caption(f"WebSocket: {_ws_snapshot['status']} · ticks received: {_ws_snapshot['tick_count']}")
+        if _ws_snapshot.get("error"):
+            st.warning(f"WebSocket detail: {_ws_snapshot['error']}")
     if st.button("Refresh instrument master", use_container_width=True):
         download_instrument_master.clear()
         st.session_state.angel_instruments = download_instrument_master()
@@ -1068,6 +1287,8 @@ if source == "Angel One":
         actual_source = "Yahoo fallback"
     else:
         data, actual_source = candles, data_note
+        data, _ws_note = _merge_websocket_tick(data, symbol, interval_label)
+        st.caption(f"Real-time feed: {_ws_note}")
 elif source == "Demo (synthetic)":
     idx = pd.date_range(end=pd.Timestamp.now().floor("min"), periods=300, freq="5min")
     rng = np.random.default_rng(42)
