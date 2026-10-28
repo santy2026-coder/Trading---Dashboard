@@ -2,7 +2,6 @@ import json
 import os
 import time
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import numpy as np
@@ -138,6 +137,7 @@ def connect_angel():
     if not result or not result.get("status"):
         raise RuntimeError(f"Angel One login failed: {(result or {}).get('message', 'Unknown error')}")
     st.session_state.angel_session = client
+    clear_angel_request_caches() if "clear_angel_request_caches" in globals() else None
     st.session_state.angel_status = "Connected"
     return result
 
@@ -285,7 +285,7 @@ def find_angel_token(symbol, exchange="NSE"):
         return token, label
     return None
 
-def get_angel_history(symbol, interval="FIVE_MINUTE", exchange="NSE"):
+def _get_angel_history_uncached(symbol, interval="FIVE_MINUTE", exchange="NSE"):
     client = st.session_state.angel_session
     if client is None:
         return pd.DataFrame(), "Angel One is not connected."
@@ -295,20 +295,11 @@ def get_angel_history(symbol, interval="FIVE_MINUTE", exchange="NSE"):
     if not resolved:
         return pd.DataFrame(), f"Could not auto-resolve Angel One token for {symbol} on {exchange}. Try selecting its exact exchange symbol."
     token, trading_symbol = resolved
-    # Never reuse a previous symbol's exchange from session_state: that can send
-    # a valid token to the wrong exchange and produce empty candle responses.
-    _raw_symbol = str(symbol).strip().upper()
-    if _raw_symbol in ("^BSESN", "BSESN"):
-        exchange = "BSE"
-    elif _raw_symbol in ("^NSEI", "NSEI", "^NSEBANK", "NSEBANK"):
-        exchange = "NSE"
-    else:
-        exchange = str(exchange or "NSE").upper()
-        if exchange not in ("NSE", "BSE"):
-            exchange = "NSE"
-    # SmartAPI historical date strings are interpreted in India market time.
-    # Streamlit Cloud may run in UTC, so don't send UTC wall-clock values.
-    to_dt = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+    exchange = st.session_state.get("_angel_last_resolved_exchange", exchange)
+    # Prevent a previous index's remembered exchange from leaking into stock requests.
+    if str(symbol).strip().upper() not in ("^NSEI", "NSEI", "^NSEBANK", "NSEBANK", "^BSESN", "BSESN"):
+        exchange = "NSE" if str(exchange).upper() not in ("NSE", "BSE", "NFO", "BFO") else exchange
+    to_dt = datetime.now()
     from_dt = to_dt - timedelta(days=5)
     params = {
         "exchange": exchange, "symboltoken": token,
@@ -317,13 +308,12 @@ def get_angel_history(symbol, interval="FIVE_MINUTE", exchange="NSE"):
         "todate": to_dt.strftime("%Y-%m-%d %H:%M"),
     }
     try:
+        _angel_wait_for_slot()
         response = client.getCandleData(params)
         if not isinstance(response, dict):
             return pd.DataFrame(), f"Angel One returned an unexpected candle response for {trading_symbol}."
         if response.get("status") is False:
             return pd.DataFrame(), f"Angel One candle API rejected {trading_symbol}: {response.get('message', '')} (errorcode={response.get('errorcode', 'N/A')})"
-        if "status" in response and response.get("status") not in (True, 1, "true", "True"):
-            return pd.DataFrame(), f"Angel One candle API status={response.get('status')}: {response.get('message', 'no message')} (errorcode={response.get('errorcode', 'N/A')})"
         rows = response.get("data") or []
         if not rows:
             return pd.DataFrame(), f"No candle data returned for {trading_symbol} ({exchange}/{token}, {interval}): {response.get('message', '')}. Check market hours, API permissions, token and interval."
@@ -346,6 +336,74 @@ def get_angel_history(symbol, interval="FIVE_MINUTE", exchange="NSE"):
         return df, f"Angel One candles: {trading_symbol} · {exchange} token {token} · {interval} · {len(df)} bars"
     except Exception as exc:
         return pd.DataFrame(), f"Angel One candle request failed: {exc}"
+
+
+# ---- Speed / rate-limit protection -----------------------------------------
+def _angel_wait_for_slot(min_gap=0.40):
+    """Keep SmartAPI requests spaced out within this Streamlit session."""
+    now = time.monotonic()
+    last = float(st.session_state.get("_angel_last_api_call_mono", 0.0) or 0.0)
+    wait = min_gap - (now - last)
+    if wait > 0:
+        time.sleep(wait)
+    st.session_state["_angel_last_api_call_mono"] = time.monotonic()
+
+
+def get_angel_history(symbol, interval="FIVE_MINUTE", exchange="NSE"):
+    """Session-cache candle requests so chart + MTF reuse identical requests.
+
+    Successful candle responses are reused for 12 seconds. Failed requests are
+    briefly cached too, preventing Streamlit reruns from hammering a rate-limited
+    broker endpoint. Returned DataFrames are copied so downstream indicators do
+    not mutate the cached object.
+    """
+    cache = st.session_state.setdefault("_angel_candle_cache", {})
+    key = (str(symbol).strip().upper(), str(interval).upper(), str(exchange).upper())
+    now = time.monotonic()
+    item = cache.get(key)
+    if item and now - item["time"] < item["ttl"]:
+        frame, note = item["frame"], item["note"]
+        return (frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()), note + " · cached"
+    frame, note = _get_angel_history_uncached(symbol, interval, exchange)
+    lower_note = str(note).lower()
+    ttl = 12.0 if not frame.empty else (10.0 if any(x in lower_note for x in ("exceed", "rate", "limit", "too many")) else 4.0)
+    cache[key] = {"time": now, "ttl": ttl, "frame": frame.copy(), "note": note}
+    # Bound session memory; old entries are disposable.
+    if len(cache) > 80:
+        for old_key, old_item in list(cache.items()):
+            if now - old_item.get("time", 0) > 120:
+                cache.pop(old_key, None)
+        while len(cache) > 80:
+            cache.pop(next(iter(cache)))
+    return frame.copy(), note
+
+
+def get_option_chain_snapshot(index_name, spot_price, max_strikes=12):
+    """Reuse option-chain snapshots briefly to avoid repeated FULL quote calls."""
+    cache = st.session_state.setdefault("_angel_option_cache", {})
+    key = (str(index_name).upper(), int(max_strikes))
+    now = time.monotonic()
+    item = cache.get(key)
+    if item and now - item["time"] < item["ttl"]:
+        frame = item["frame"]
+        return (frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()), item["note"] + " · cached"
+    frame, note = _get_option_chain_snapshot_uncached(index_name, spot_price, max_strikes)
+    lower_note = str(note).lower()
+    ttl = 20.0 if not frame.empty else (10.0 if any(x in lower_note for x in ("exceed", "rate", "limit", "too many")) else 4.0)
+    cache[key] = {"time": now, "ttl": ttl, "frame": frame.copy(), "note": note}
+    if len(cache) > 12:
+        for old_key, old_item in list(cache.items()):
+            if now - old_item.get("time", 0) > 120:
+                cache.pop(old_key, None)
+        while len(cache) > 12:
+            cache.pop(next(iter(cache)))
+    return frame.copy(), note
+
+
+def clear_angel_request_caches():
+    st.session_state["_angel_candle_cache"] = {}
+    st.session_state["_angel_option_cache"] = {}
+
 
 def add_indicators(df):
     if df.empty:
@@ -545,7 +603,8 @@ def build_macro_context():
 
 def analyze_signal(d, rr_multiple=2):
     if len(d) < 30:
-        return {"signal": "WAIT", "score": 0, "confidence": 0, "reasons": ["Not enough candles for stable indicators."], "patterns": []}
+        return {"signal": "WAIT", "early_signal": "NO EARLY SETUP", "score": 0, "confidence": 0,
+                "reasons": ["Not enough candles for stable indicators."], "early_reasons": [], "patterns": []}
     a = d.iloc[-1]
     bull = bear = 0
     reasons = []
@@ -615,7 +674,55 @@ def analyze_signal(d, rr_multiple=2):
     elif macro_bias == "Bearish":
         bear += 1; reasons.append("Macro +1: global/Indian risk context is risk-off")
     score = bull - bear
-    # Require a directional edge and minimum number of supporting checks.
+
+    # Early setup detector: deliberately separate from the stricter confirmed signal.
+    # It watches the first change in short-term momentum rather than waiting for a
+    # fully developed EMA9/EMA20 trend. Early setups are more sensitive and can fail.
+    prev2 = d.iloc[-3] if len(d) >= 3 else prev
+    macd_hist = d["MACD"] - d["MACD_Signal"]
+    hist_rising = bool(pd.notna(macd_hist.iloc[-1]) and pd.notna(macd_hist.iloc[-2]) and macd_hist.iloc[-1] > macd_hist.iloc[-2])
+    hist_falling = bool(pd.notna(macd_hist.iloc[-1]) and pd.notna(macd_hist.iloc[-2]) and macd_hist.iloc[-1] < macd_hist.iloc[-2])
+    ema9_rising = bool(pd.notna(a["EMA9"]) and pd.notna(prev["EMA9"]) and a["EMA9"] > prev["EMA9"])
+    ema9_falling = bool(pd.notna(a["EMA9"]) and pd.notna(prev["EMA9"]) and a["EMA9"] < prev["EMA9"])
+    price_reclaim_ema9 = bool(pd.notna(a["EMA9"]) and pd.notna(prev["EMA9"]) and a["Close"] > a["EMA9"] and prev["Close"] <= prev["EMA9"])
+    price_lose_ema9 = bool(pd.notna(a["EMA9"]) and pd.notna(prev["EMA9"]) and a["Close"] < a["EMA9"] and prev["Close"] >= prev["EMA9"])
+    rsi_rising = bool(pd.notna(a["RSI"]) and pd.notna(prev["RSI"]) and pd.notna(prev2["RSI"]) and a["RSI"] > prev["RSI"] > prev2["RSI"] and 42 <= a["RSI"] <= 68)
+    rsi_falling = bool(pd.notna(a["RSI"]) and pd.notna(prev["RSI"]) and pd.notna(prev2["RSI"]) and a["RSI"] < prev["RSI"] < prev2["RSI"] and 32 <= a["RSI"] <= 58)
+    early_bull_checks = {
+        "EMA9 short-term slope turning up": ema9_rising,
+        "Price reclaimed EMA9": price_reclaim_ema9,
+        "MACD histogram improving": hist_rising,
+        "RSI rising from momentum zone": rsi_rising,
+        "Stochastic bullish turn": bool(stoch_bull),
+        "Early resistance break": bool(pd.notna(prior_high) and a["Close"] > prior_high),
+    }
+    early_bear_checks = {
+        "EMA9 short-term slope turning down": ema9_falling,
+        "Price lost EMA9": price_lose_ema9,
+        "MACD histogram weakening": hist_falling,
+        "RSI falling from momentum zone": rsi_falling,
+        "Stochastic bearish turn": bool(stoch_bear),
+        "Early support break": bool(pd.notna(prior_low) and a["Close"] < prior_low),
+    }
+    early_bull_count = sum(early_bull_checks.values())
+    early_bear_count = sum(early_bear_checks.values())
+    early_reasons = []
+    if early_bull_count:
+        early_reasons.extend(["Bullish early trigger: " + k for k, v in early_bull_checks.items() if v])
+    if early_bear_count:
+        early_reasons.extend(["Bearish early trigger: " + k for k, v in early_bear_checks.items() if v])
+    # Early watch requires at least two short-term triggers plus a small score edge;
+    # confirmed BUY/SELL below retains the original higher confirmation threshold.
+    if early_bull_count >= 2 and score >= 1 and bull >= 3 and early_bull_count > early_bear_count:
+        early_signal = "EARLY BUY WATCH"
+    elif early_bear_count >= 2 and score <= -1 and bear >= 3 and early_bear_count > early_bull_count:
+        early_signal = "EARLY SELL WATCH"
+    else:
+        early_signal = "NO EARLY SETUP"
+    if not early_reasons:
+        early_reasons = ["No clear short-term momentum turn yet."]
+
+    # Confirmed signals remain stricter; the separate early-watch label appears sooner.
     signal = "BUY" if score >= 4 and bull >= 5 else "SELL" if score <= -4 and bear >= 5 else "WAIT"
     total = max(bull + bear, 1)
     confidence = int(round(100 * max(bull, bear) / total)) if signal != "WAIT" else int(round(100 * abs(score) / max(total, 1)))
@@ -631,8 +738,14 @@ def analyze_signal(d, rr_multiple=2):
         sl, t1, t2, t3 = entry+risk, entry-risk*rr_multiple, entry-risk*2, entry-risk*3
     else: sl = t1 = t2 = t3 = np.nan
     trend = "Bullish" if a["EMA9"] > a["EMA20"] and a["Close"] > a["EMA50"] else "Bearish" if a["EMA9"] < a["EMA20"] and a["Close"] < a["EMA50"] else "Mixed"
-    return {"signal": signal, "score": score, "bullish_score": bull, "bearish_score": bear, "confidence": confidence,
-            "reasons": reasons, "entry": entry, "sl": sl, "t1": t1, "t2": t2, "t3": t3, "atr": atr,
+    early_sl = entry - risk if early_signal == "EARLY BUY WATCH" else entry + risk if early_signal == "EARLY SELL WATCH" else np.nan
+    early_t1 = entry + risk * rr_multiple if early_signal == "EARLY BUY WATCH" else entry - risk * rr_multiple if early_signal == "EARLY SELL WATCH" else np.nan
+    return {"signal": signal, "early_signal": early_signal, "early_bull_checks": early_bull_count,
+            "early_bear_checks": early_bear_count, "early_reasons": early_reasons,
+            "score": score, "bullish_score": bull, "bearish_score": bear, "confidence": confidence,
+            "reasons": reasons, "entry": entry, "sl": sl, "t1": t1, "t2": t2, "t3": t3,
+            "early_entry": entry if early_signal != "NO EARLY SETUP" else np.nan,
+            "early_sl": early_sl, "early_t1": early_t1, "atr": atr,
             "rr": f"1:{rr_multiple:g} (T1), 1:2 (T2), 1:3 (T3)", "patterns": patterns, "trend": trend, "risk": risk}
 
 def calc_backtest(d, cost_bps=10):
@@ -666,7 +779,7 @@ def save_journal(df):
 
 
 
-def get_option_chain_snapshot(index_name, spot_price, max_strikes=12):
+def _get_option_chain_snapshot_uncached(index_name, spot_price, max_strikes=12):
     """Fetch a best-effort Angel One NFO option-chain snapshot using FULL market data.
     Returns rows with OI and polling-based OI change; never fabricates PCR/OI.
     """
@@ -723,6 +836,7 @@ def get_option_chain_snapshot(index_name, spot_price, max_strikes=12):
     frame = frame.head(50)
     token_list = frame[token_col].astype(str).tolist()
     try:
+        _angel_wait_for_slot()
         response = client.getMarketData("FULL", {"NFO": token_list})
         payload = (response or {}).get("data") or {}
         fetched = payload.get("fetched") or []
@@ -912,7 +1026,7 @@ with st.sidebar:
     angel_interval = {"1 minute": "ONE_MINUTE", "3 minutes": "THREE_MINUTE", "5 minutes": "FIVE_MINUTE", "15 minutes": "FIFTEEN_MINUTE", "Daily": "ONE_DAY"}[interval_label]
     rr_multiple = st.selectbox("Risk : Reward target (T1)", [1, 2, 3, 5], index=1, format_func=lambda x: f"1:{x}")
     refresh_enabled = st.toggle("Auto-refresh", value=True, help="Keeps live quote snapshots updating so Change in OI can compare the latest snapshot with the previous one.")
-    refresh_seconds = st.selectbox("Refresh interval", [10, 15, 30, 60], index=2)
+    refresh_seconds = st.selectbox("Refresh interval", [10, 15, 30, 60], index=2, help="Broker requests are cached briefly and rate-limited to prevent Exceeding excess errors. This interval refreshes the dashboard, not necessarily the exchange feed.")
     st.session_state.refresh_on = refresh_enabled
     if refresh_enabled:
         st_autorefresh(interval=refresh_seconds * 1000, key="market_refresh")
@@ -937,7 +1051,12 @@ with st.sidebar:
     if st.button("Refresh instrument master", use_container_width=True):
         download_instrument_master.clear()
         st.session_state.angel_instruments = download_instrument_master()
+        clear_angel_request_caches()
         st.info(f"Instrument master rows: {len(st.session_state.angel_instruments)}")
+    if st.button("Force refresh market data", use_container_width=True):
+        clear_angel_request_caches()
+        get_yahoo_history.clear()
+        st.rerun()
 
 if source == "Angel One":
     with st.spinner("Loading Angel One candles..."):
@@ -1034,6 +1153,10 @@ except Exception:
 signal = analyze_signal(d, rr_multiple)
 last = d.iloc[-1]
 st.caption(f"Selected: **{symbol_label}** · Data source: **{actual_source}** · Last candle: {d.index[-1]}")
+if signal.get("early_signal") == "EARLY BUY WATCH":
+    st.warning("🟢 EARLY BUY WATCH — short-term momentum is turning up. This is an early alert, not a confirmed entry; check the listed triggers, spread and risk before acting.")
+elif signal.get("early_signal") == "EARLY SELL WATCH":
+    st.warning("🔴 EARLY SELL WATCH — short-term momentum is turning down. This is an early alert, not a confirmed entry; check the listed triggers, spread and risk before acting.")
 
 # Dashboard overview styled to match the user's reference screenshots.
 # These are display-only metrics; confidence is an indicator score, not a guaranteed win probability.
@@ -1059,14 +1182,15 @@ _bear_score = int(signal.get("bearish_score", 0))
 _score_total = max(_bull_score + _bear_score, 1)
 _bull_conf = round(100 * _bull_score / _score_total)
 _bear_conf = round(100 * _bear_score / _score_total)
-summary1 = st.columns(7)
+summary1 = st.columns(8)
 summary1[0].metric("Current Price", f"{float(last['Close']):,.2f}")
 summary1[1].metric("EMA20", _metric_value(last, "EMA20"))
 summary1[2].metric("RSI (14)", _metric_value(last, "RSI", "{:.1f}"))
 summary1[3].metric("MACD", _metric_value(last, "MACD"))
 summary1[4].metric("Bullish Score", _bull_score, f"Score confidence {_bull_conf}%")
 summary1[5].metric("Bearish Score", _bear_score, f"Score confidence {_bear_conf}%")
-summary1[6].metric("Signal", signal.get("signal", "WAIT"), f"Signal confidence {signal.get('confidence', 0)}%")
+summary1[6].metric("Early Signal", signal.get("early_signal", "NO EARLY SETUP"))
+summary1[7].metric("Confirmed Signal", signal.get("signal", "WAIT"), f"Rule strength {signal.get('confidence', 0)}%")
 summary2 = st.columns(7)
 summary2[0].metric("VWAP (session, volume-weighted)", _metric_value(last, "VWAP"))
 summary2[1].metric("EMA50", _metric_value(last, "EMA50"))
@@ -1142,7 +1266,6 @@ _mtf_display_plan = [
     ("15m", "FIFTEEN_MINUTE", "15m", "5d"),
 ]
 for _label, _angel_tf, _yahoo_interval, _period in _mtf_display_plan:
-    _mtf_note = ""
     # Each row MUST use a separate request for its own interval. Never derive
     # 1m/3m/5m/15m OHLC by copying the selected chart's last price.
     if source == "Angel One" and actual_source != "Yahoo fallback":
@@ -1218,7 +1341,6 @@ for _label, _angel_tf, _yahoo_interval, _period in _mtf_display_plan:
         "Close": f"{_close:,.2f}" if np.isfinite(_close) else "N/A",
         "Trend": _trend,
         "Data Source": ("Angel One API" if source == "Angel One" and actual_source != "Yahoo fallback" else "Yahoo fallback" if source == "Angel One" else actual_source),
-        "Feed/API Status": (_mtf_note if _mtf_note else ("OK · completed candle selected" if np.isfinite(_open) and np.isfinite(_close) else "No completed candle available for this interval")),
     })
 # Guard against a frozen/mis-mapped feed: if every timeframe reports the exact
 # same Open and Close, and each candle is itself flat, this is not trustworthy
@@ -1238,12 +1360,10 @@ _mtf_feed_suspect = (
     and all(abs(o - c) < 0.005 for o, c in _valid_mtf)
 )
 if _mtf_feed_suspect:
-    # Keep the actual parsed OHLC visible for diagnosis. Do NOT replace real
-    # returned values with N/A: the warning should block confirmation, not hide
-    # the evidence needed to find a stale/mis-mapped candle response.
     for _r in _mtf_rows:
+        _r["Open"] = "N/A — feed check"
+        _r["Close"] = "N/A — feed check"
         _r["Trend"] = "Unverified feed"
-        _r["Feed/API Status"] = str(_r.get("Feed/API Status", "")) + " · identical/flat OHLC suspected; excluded from MTF confirmation"
     st.error(
         f"MTF data quality warning for {symbol_label} ({symbol}): 3 or more timeframes returned the same flat Open/Close. "
         "These values are NOT valid MTF confirmation. Check the Data Source column below. "
@@ -1258,9 +1378,7 @@ if _mtf_feed_suspect:
                 "chart_source": actual_source,
                 "requested_exchange": "BSE" if str(symbol).upper() in ("^BSESN", "BSESN") else "NSE",
                 "intervals_requested": [r["Timeframe"] for r in _mtf_rows],
-                "api_status_by_timeframe": {r["Timeframe"]: r.get("Feed/API Status", "N/A") for r in _mtf_rows},
-                "parsed_candle_by_timeframe": {r["Timeframe"]: {"candle_time": r.get("Candle Time"), "open": r.get("Open"), "close": r.get("Close"), "trend": r.get("Trend")} for r in _mtf_rows},
-                "note": "Each timeframe is requested separately from getCandleData. Parsed OHLC is kept visible even when suspicious; suspicious values are excluded from MTF confirmation. Exchange is resolved per symbol and candle request dates use Asia/Kolkata time.",
+                "note": "Each timeframe is requested separately from getCandleData. Review the per-timeframe warnings above for API rejection, empty rows, or token resolution failures.",
             })
 _mtf_table = pd.DataFrame(_mtf_rows)
 st.dataframe(_mtf_table, use_container_width=True, hide_index=True)
@@ -1297,12 +1415,19 @@ with idx2:
 signal = analyze_signal(d, rr_multiple)
 
 st.divider()
-m1, m2, m3, m4, m5 = st.columns(5)
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 m1.metric("Last price", f"{last['Close']:,.2f}")
-m2.metric("Signal", signal["signal"], f"Score {signal['score']:+d}")
-m3.metric("RSI (14)", f"{last['RSI']:.1f}" if pd.notna(last["RSI"]) else "N/A")
-m4.metric("ADX (14)", f"{last['ADX']:.1f}" if pd.notna(last["ADX"]) else "N/A")
-m5.metric("Volume / avg", f"{last['Vol_Ratio']:.2f}x" if pd.notna(last["Vol_Ratio"]) else "N/A")
+m2.metric("Early signal", signal.get("early_signal", "NO EARLY SETUP"))
+m3.metric("Confirmed signal", signal["signal"], f"Score {signal['score']:+d}")
+m4.metric("RSI (14)", f"{last['RSI']:.1f}" if pd.notna(last["RSI"]) else "N/A")
+m5.metric("ADX (14)", f"{last['ADX']:.1f}" if pd.notna(last["ADX"]) else "N/A")
+m6.metric("Volume / avg", f"{last['Vol_Ratio']:.2f}x" if pd.notna(last["Vol_Ratio"]) else "N/A")
+if signal.get("early_signal") != "NO EARLY SETUP":
+    _early1, _early2, _early3 = st.columns(3)
+    _early1.metric("Early entry reference", f"{signal['early_entry']:,.2f}")
+    _early2.metric("Early ATR stop reference", f"{signal['early_sl']:,.2f}")
+    _early3.metric("Early T1 reference", f"{signal['early_t1']:,.2f}")
+    st.caption("Early entry/SL/target are research references only. Early signals intentionally trigger sooner and can produce more false alerts than confirmed signals.")
 
 if signal["signal"] != "WAIT":
     a, b, c, e, f = st.columns(5)
@@ -1335,7 +1460,12 @@ with left:
     st.plotly_chart(fig, use_container_width=True)
     st.caption("Pattern labels are heuristic; some patterns need trend/context confirmation. Multi-candle patterns are labelled on their confirmation candle.")
 with right:
-    st.subheader("Combined signal checks")
+    st.subheader("Early trend-start checks")
+    st.write(f"**Early status:** {signal.get('early_signal', 'NO EARLY SETUP')}")
+    for item in signal.get("early_reasons", []):
+        st.write(("🟢 " if "Bullish" in item else "🔴 " if "Bearish" in item else "⚪ ") + item)
+    st.divider()
+    st.subheader("Confirmed signal checks")
     for item in signal.get("reasons", []):
         st.write(("🟢 " if "above" in item.lower() or "bullish" in item.lower() else "⚪ ") + item)
     st.subheader("Candlestick patterns")
